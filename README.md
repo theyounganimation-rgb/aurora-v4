@@ -71,7 +71,7 @@ The local release gate additionally checks the signed Codex account handshake an
 
 The release fingerprint is written only after the complete local gate passes. That prevents a successful test result from being reused after source changes.
 
-Current `v0.1.0` source measurements, regenerated for this release:
+Current public-source measurements, regenerated for this release:
 
 | Evidence | Measured result |
 | --- | ---: |

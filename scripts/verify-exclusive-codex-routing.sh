@@ -17,7 +17,16 @@ fail() {
   exit 1
 }
 
-for command in swift jq rg strings; do
+typeset -a REGEX_SEARCH FIXED_SEARCH
+if command -v rg >/dev/null 2>&1; then
+  REGEX_SEARCH=(rg)
+  FIXED_SEARCH=(rg -F)
+else
+  REGEX_SEARCH=(grep -E)
+  FIXED_SEARCH=(grep -F)
+fi
+
+for command in swift jq strings; do
   command -v "$command" >/dev/null 2>&1 || fail "required command '$command' was not found"
 done
 
@@ -158,16 +167,16 @@ for source in "${LIVE_BOUNDARY_FILES[@]}"; do
 done
 
 LEGACY_IDENTIFIER_PATTERN='DesktopTask|ComputerUse|MacDesktopEnvironment|NativeCapabilityRouter|NativeDesktopAction|NativeDesktopControl|NativeScreen|SafeComputerAccess|NotesCapabilityBroker|AppleNotesService|ConnectedMailService|CalendarEvent|ReminderService|YouTubeSearch|WebResearch|IntentProposal|TypedCapabilityAuthorization|publishDesktopTaskUpdate|configureResearchAPIKey'
-if rg -n "$LEGACY_IDENTIFIER_PATTERN" "${LIVE_BOUNDARY_VIEWS[@]}"; then
+if "${REGEX_SEARCH[@]}" -n "$LEGACY_IDENTIFIER_PATTERN" "${LIVE_BOUNDARY_VIEWS[@]}"; then
   fail "a live production boundary still references the retired executor stack"
 fi
 
 LEGACY_TOOL_LITERAL_PATTERN='"(intent_proposal|research|youtube_search|calendar_action|personal_action|computer_list|computer_read|computer_open|computer_action|computer_task|computer_visual|computer_run|mail)"'
-if rg -n "$LEGACY_TOOL_LITERAL_PATTERN" "${LIVE_BOUNDARY_VIEWS[@]}"; then
+if "${REGEX_SEARCH[@]}" -n "$LEGACY_TOOL_LITERAL_PATTERN" "${LIVE_BOUNDARY_VIEWS[@]}"; then
   fail "a live production boundary still names a retired Realtime tool"
 fi
 
-if rg -n 'desktopTaskCoordinator[[:space:]]*\.[[:space:]]*configure[[:space:]]*\(|configureResearchAPIKey[[:space:]]*\(' \
+if "${REGEX_SEARCH[@]}" -n 'desktopTaskCoordinator[[:space:]]*\.[[:space:]]*configure[[:space:]]*\(|configureResearchAPIKey[[:space:]]*\(' \
     "${LIVE_BOUNDARY_VIEWS[@]}"; then
   fail "the voice API key can still be handed to a retired task or research route"
 fi
@@ -185,13 +194,13 @@ require_source_literal() {
   local source="$1"
   local literal="$2"
   local failure="$3"
-  rg -q -F -- "$literal" "$source" || fail "$failure"
+  "${FIXED_SEARCH[@]}" -q -- "$literal" "$source" || fail "$failure"
 }
 
 source_line() {
   local source="$1"
   local literal="$2"
-  rg -n -F -- "$literal" "$source" | head -n 1 | cut -d: -f1
+  "${FIXED_SEARCH[@]}" -n -- "$literal" "$source" | head -n 1 | cut -d: -f1
 }
 
 require_source_literal "$APP_DELEGATE_SOURCE" \
@@ -235,7 +244,7 @@ RUNTIME_SHUTDOWN_LINE="$(source_line "$APP_MODEL_SOURCE" 'await toolRegistry.shu
    && "$CANCEL_DRAIN_LINE" -lt "$RUNTIME_SHUTDOWN_LINE" ]] \
   || fail 'termination ordering no longer persists handoffs, drains direct work, then detaches the runtime'
 
-[[ "$(rg -c -F 'shutdownDelegateTaskRuntime()' "$APP_MODEL_SOURCE")" == "1" ]] \
+[[ "$("${FIXED_SEARCH[@]}" -c 'shutdownDelegateTaskRuntime()' "$APP_MODEL_SOURCE")" == "1" ]] \
   || fail 'delegate runtime shutdown escaped the single model-owned termination boundary'
 
 typeset -a LEGACY_SELF_TEST_FLAGS
@@ -255,15 +264,15 @@ for source in "${COMPILED_SOURCES[@]}"; do
   absolute="$ROOT/Sources/Aurora/$source"
   [[ -f "$absolute" ]] || fail "SwiftPM described a missing production source: $source"
   scan_source="$absolute"
-  if rg -q '^#if AURORA_LEGACY_MOTOR[[:space:]]*$' "$absolute"; then
+  if "${REGEX_SEARCH[@]}" -q '^#if AURORA_LEGACY_MOTOR[[:space:]]*$' "$absolute"; then
     scan_source="$LIVE_VIEW_DIR/${source//\//_}"
     write_production_view "$absolute" "$scan_source"
   fi
-  if rg -n -F 'https://api.openai.com/v1/responses' "$scan_source"; then
+  if "${FIXED_SEARCH[@]}" -n 'https://api.openai.com/v1/responses' "$scan_source"; then
     fail "the direct Responses API endpoint is present in compiled source $source"
   fi
   for flag in "${LEGACY_SELF_TEST_FLAGS[@]}"; do
-    if rg -n -F -- "$flag" "$scan_source"; then
+    if "${FIXED_SEARCH[@]}" -n -- "$flag" "$scan_source"; then
       fail "legacy launch flag $flag is present in compiled source $source"
     fi
   done
@@ -283,12 +292,12 @@ fi
 
 STRINGS_FILE="$(mktemp "${TMPDIR:-/private/tmp}/aurora-release-strings.XXXXXX")"
 strings -a "$RELEASE_BINARY" > "$STRINGS_FILE"
-if rg -n -F 'https://api.openai.com/v1/responses' "$STRINGS_FILE"; then
+if "${FIXED_SEARCH[@]}" -n 'https://api.openai.com/v1/responses' "$STRINGS_FILE"; then
   rm -f "$STRINGS_FILE"
   fail "release executable still contains the direct Responses API endpoint"
 fi
 for flag in "${LEGACY_SELF_TEST_FLAGS[@]}"; do
-  if rg -n -F -- "$flag" "$STRINGS_FILE"; then
+  if "${FIXED_SEARCH[@]}" -n -- "$flag" "$STRINGS_FILE"; then
     rm -f "$STRINGS_FILE"
     fail "release executable still contains legacy launch flag $flag"
   fi
