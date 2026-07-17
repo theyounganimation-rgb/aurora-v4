@@ -1,5 +1,7 @@
 # Aurora V4
 
+[![Verify public source](https://github.com/theyounganimation-rgb/aurora-v4/actions/workflows/verify.yml/badge.svg)](https://github.com/theyounganimation-rgb/aurora-v4/actions/workflows/verify.yml)
+
 Aurora V4 is a native macOS voice-agent architecture for a continuing digital person: Realtime conversation, bounded memory, scoped tool delegation, and verified recovery in one app. It is not a browser wrapper and does not place voice in front of a separate text agent.
 
 The primary loop is:
