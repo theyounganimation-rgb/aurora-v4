@@ -1,0 +1,30 @@
+name: Verify public source
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic-offline-verification:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show Swift toolchain
+        run: swift --version
+
+      - name: Verify public release boundary
+        run: ./scripts/verify-public-release.sh
+
+      - name: Build and verify Aurora offline
+        run: ./scripts/verify-ci.sh

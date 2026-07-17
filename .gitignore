@@ -1,0 +1,29 @@
+.DS_Store
+.build/
+.swiftpm/
+dist/
+DerivedData/
+*.xcarchive
+*.xcuserstate
+*.aurora-local
+
+# Private runtime/deployment configuration.
+.env
+.env.*
+!.env.example
+
+# Signing and provisioning material never belongs in source control.
+*.cer
+*.key
+*.mobileprovision
+*.p12
+*.pem
+*.provisionprofile
+
+# Packaged applications and archives never belong in the public source tree.
+*.app
+*.ipa
+*.zip
+
+# Separate projects and private release surfaces.
+website/
