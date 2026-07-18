@@ -13,12 +13,14 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
     case taskNotFound
     case noActiveTurn
     case unavailable
+    case chatGPTLoginRequired
 
     var errorDescription: String? {
         switch self {
         case .taskNotFound: return "The task was not found."
         case .noActiveTurn: return "The task has no active turn."
         case .unavailable: return "The verification runtime is unavailable."
+        case .chatGPTLoginRequired: return "Codex must be signed in with ChatGPT."
         }
     }
 }
@@ -244,6 +246,7 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
     private var reconciliationByThreadID: [String: CodexDelegateTaskReconciliation] = [:]
     private var reconciliationTaskIDs: [String] = []
     private var detachedTaskPersistenceAvailable = true
+    private var detachedTaskPersistenceError: CodexTaskRuntimeError?
 
     func setEventHandler(
         _ handler: (@Sendable (CodexTaskRuntimeEvent) -> Void)?
@@ -392,11 +395,16 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
     }
 
     func supportsDetachedTaskPersistence() async throws -> Bool {
-        detachedTaskPersistenceAvailable
+        if let detachedTaskPersistenceError { throw detachedTaskPersistenceError }
+        return detachedTaskPersistenceAvailable
     }
 
     func setDetachedTaskPersistenceAvailable(_ available: Bool) {
         detachedTaskPersistenceAvailable = available
+    }
+
+    func setDetachedTaskPersistenceError(_ error: CodexTaskRuntimeError?) {
+        detachedTaskPersistenceError = error
     }
 
     func configureInterrupt(
@@ -2792,9 +2800,114 @@ private struct DelegateTaskVerification {
         try await verifyUnconfirmedCancellationTruth(
             defaultProjectDirectory: defaultProjectDirectory
         )
+        try await verifyFreshInstallDefaultWorkspace()
+        try await verifyRuntimeReadinessAndSafeReprobe()
 
         try verifyNoPhraseRouterReferences()
         return checks
+    }
+
+    private mutating func verifyFreshInstallDefaultWorkspace() async throws {
+        let home = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build", isDirectory: true)
+            .appendingPathComponent(
+                "aurora-fresh-home-\(UUID().uuidString.lowercased())",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: home,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let runtime = VerificationCodexDelegateRuntime()
+        let coordinator = DelegateTaskCoordinator(
+            runtime: runtime,
+            homeDirectory: home,
+            store: nil,
+            legacyRecovery: nil
+        )
+        let proposal = try DelegateTaskProposal(
+            commitment: .execute,
+            operation: .start,
+            targetReference: .newTask,
+            taskKind: .coding,
+            parameters: DelegateTaskParameters(
+                goal: "Build a small judge project."
+            )
+        )
+        let decision = DelegateTaskAuthorizationFactory.issue(
+            proposal: proposal,
+            context: context(
+                callID: "fresh-install-start",
+                sessionID: "fresh-install-session",
+                turnID: "fresh-install-owner-turn"
+            ),
+            activeTaskBinding: nil,
+            authorizationID: "fresh-install-authorization"
+        )
+        guard let authorization = decision.envelope else {
+            throw DelegateTaskVerificationFailure.failed(
+                "the fresh-install project fixture was not authorized"
+            )
+        }
+        let accepted = await coordinator.start(
+            proposal: proposal,
+            authorization: authorization
+        )
+        let reachedRuntime = await eventually {
+            await runtime.startRecords().count == 1
+        }
+        let expectedWorkspace = home
+            .appendingPathComponent("Documents", isDirectory: true)
+            .appendingPathComponent("Aurora Projects", isDirectory: true)
+            .resolvingSymlinksInPath()
+        let start = await runtime.startRecords().first
+        var isDirectory: ObjCBool = false
+        let workspaceExists = FileManager.default.fileExists(
+            atPath: expectedWorkspace.path,
+            isDirectory: &isDirectory
+        )
+        try expect(
+            accepted.ok
+                && reachedRuntime
+                && workspaceExists
+                && isDirectory.boolValue
+                && accepted.snapshot?.workspacePath == expectedWorkspace.path
+                && start?.options.workingDirectory?.resolvingSymlinksInPath()
+                    == expectedWorkspace,
+            "a fresh install retained a machine-specific or missing Codex workspace"
+        )
+        await runtime.releaseBlockedStart()
+        await coordinator.shutdown()
+    }
+
+    private mutating func verifyRuntimeReadinessAndSafeReprobe() async throws {
+        let runtime = VerificationCodexDelegateRuntime()
+        await runtime.setDetachedTaskPersistenceAvailable(false)
+        let coordinator = DelegateTaskCoordinator(
+            runtime: runtime,
+            homeDirectory: FileManager.default.homeDirectoryForCurrentUser,
+            defaultProjectDirectory: FileManager.default.homeDirectoryForCurrentUser,
+            store: nil,
+            legacyRecovery: nil
+        )
+        let unavailable = await coordinator.prewarmRuntime()
+        await runtime.setDetachedTaskPersistenceError(.chatGPTLoginRequired)
+        let signInRequired = await coordinator.prewarmRuntime(forceReconnect: true)
+        await runtime.setDetachedTaskPersistenceError(nil)
+        await runtime.setDetachedTaskPersistenceAvailable(true)
+        let ready = await coordinator.prewarmRuntime(forceReconnect: true)
+        let shutdownCount = await runtime.numberOfShutdowns()
+        try expect(
+            unavailable == .durableRuntimeUnavailable
+                && signInRequired == .chatGPTSignInRequired
+                && ready == .ready
+                && shutdownCount == 2,
+            "Codex readiness hid sign-in/durability state or could not safely re-probe"
+        )
+        await coordinator.shutdown()
     }
 
     private mutating func verifyPersistentRestartContinuity() async throws {

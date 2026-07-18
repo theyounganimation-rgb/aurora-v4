@@ -5,6 +5,7 @@ This restore point captures an installed build that the owner confirmed was usab
 ## Verified identity
 
 - Source fingerprint: `697e436dde6f8225beaa5ff5a12d516f5a7a1f3f01a6c58ffdd5f0fb826b3cea`
+- Source archive SHA-256: `7da4467a059a7254df735896c2296c5eff15166b0519524d26bac0042eb0bbd0`
 - Signed executable SHA-256: `8018a9344cf78c7afbbd317889ed646f0a96011bba33273990297699afb6dd8d`
 - App archive SHA-256: `a650a4b393fdf67cf0065a49198496639e4baefe8b074ad0fa6e15535b5c4cda`
 - Bundle identifier: `ai.aurora.voice`

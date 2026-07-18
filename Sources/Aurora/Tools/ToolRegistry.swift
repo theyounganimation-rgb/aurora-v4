@@ -465,8 +465,12 @@ public actor ToolRegistry {
         _ = await delegateTaskCoordinator.sessionContext(sessionID: sessionID)
     }
 
-    func prewarmDelegateTaskRuntime() async {
-        await delegateTaskCoordinator.prewarmRuntime()
+    func prewarmDelegateTaskRuntime(
+        forceReconnect: Bool = false
+    ) async -> DelegateTaskRuntimeReadiness {
+        await delegateTaskCoordinator.prewarmRuntime(
+            forceReconnect: forceReconnect
+        )
     }
 
     func hasActiveDelegateTask() async -> Bool {

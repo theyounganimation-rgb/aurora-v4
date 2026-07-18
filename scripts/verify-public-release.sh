@@ -4,36 +4,93 @@ set -euo pipefail
 ROOT="${0:A:h:h}"
 cd "$ROOT"
 
-tracked_files="$(git ls-files)"
-if [[ -z "$tracked_files" ]]; then
-  print -u2 "public release scan requires a staged or committed source tree"
+typeset -a public_candidates packaging_candidates scan_candidates
+typeset -A seen_candidates
+
+public_candidates=("${(@f)$(git ls-files --cached --others --exclude-standard)}")
+if (( ${#public_candidates} == 0 )); then
+  print -u2 "public release scan requires a staged, committed, or untracked source tree"
   exit 1
 fi
 
-forbidden_paths="$(
-  print -r -- "$tracked_files" \
-    | grep -E '(^|/)(\.env($|\.)|\.build/|dist/|website/)|\.(app|ipa|zip|p12|pem|key|mobileprovision|provisionprofile|xcarchive)(/|$)' \
+# Release packaging copies these paths directly, even when a local ignore rule
+# would otherwise hide one of their files from Git. Scan the exact compilation
+# inputs whenever the packager invokes this verifier.
+if [[ "${AURORA_SCAN_PACKAGING_INPUTS:-0}" == "1" ]]; then
+  packaging_candidates=(
+    "${(@f)$(find Sources Resources -type f -print 2>/dev/null | LC_ALL=C sort)}"
+    Package.swift
+    scripts/render-icon.swift
+    scripts/source-fingerprint.sh
+  )
+fi
+
+for candidate in "${public_candidates[@]}" "${packaging_candidates[@]}"; do
+  [[ -n "$candidate" && -f "$candidate" ]] || continue
+  [[ -n "${seen_candidates[$candidate]:-}" ]] && continue
+  seen_candidates[$candidate]=1
+  scan_candidates+=("$candidate")
+done
+
+forbidden_paths="$({
+  for candidate in "${public_candidates[@]}"; do
+    print -r -- "$candidate"
+  done
+} | grep -E '(^|/)(\.env($|\.)|\.build/|dist/|website/)|\.(app|ipa|zip|p12|pem|key|mobileprovision|provisionprofile|xcarchive)(/|$)' \
     | grep -v -E '(^|/)\.env\.example$' \
-    || true
-)"
+    || true)"
 if [[ -n "$forbidden_paths" ]]; then
   print -u2 "public release contains forbidden private or packaged paths:"
   print -u2 -r -- "$forbidden_paths"
   exit 1
 fi
 
+is_scanner_fixture() {
+  case "$1" in
+    scripts/verify-public-release.sh|scripts/verify-public-release-regressions.sh)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 scan_content() {
   local label="$1"
   local pattern="$2"
-  local matches
-  matches="$(
-    git grep --cached -n -I -E "$pattern" -- . \
-      ':(exclude)scripts/verify-public-release.sh' \
-      || true
-  )"
-  if [[ -n "$matches" ]]; then
-    print -u2 "public release contains $label:"
-    print -u2 -r -- "$matches"
+  local candidate first_match line_number index_matches
+  typeset -a working_hits index_hits
+
+  # Inspect the bytes that are actually on disk. Report only location metadata;
+  # echoing the matching line would turn a detection into a credential leak.
+  for candidate in "${scan_candidates[@]}"; do
+    is_scanner_fixture "$candidate" && continue
+    first_match="$(LC_ALL=C grep -I -n -m 1 -E "$pattern" -- "$candidate" 2>/dev/null || true)"
+    [[ -n "$first_match" ]] || continue
+    line_number="${first_match%%:*}"
+    [[ "$line_number" == <-> ]] || line_number="?"
+    working_hits+=("$candidate:$line_number [working tree]")
+  done
+
+  # Also inspect the staged bytes so an already-staged secret cannot be hidden
+  # by replacing the working-tree copy with a clean file before a commit.
+  index_matches="$(git grep --cached -l -I -E "$pattern" -- . \
+    ':(exclude)scripts/verify-public-release.sh' \
+    ':(exclude)scripts/verify-public-release-regressions.sh' \
+    2>/dev/null || true)"
+  if [[ -n "$index_matches" ]]; then
+    index_hits=("${(@f)index_matches}")
+  fi
+
+  if (( ${#working_hits} > 0 || ${#index_hits} > 0 )); then
+    print -u2 "public release contains $label (matched values are intentionally redacted):"
+    for candidate in "${working_hits[@]}"; do
+      print -u2 -r -- "  $candidate"
+    done
+    for candidate in "${index_hits[@]}"; do
+      [[ -n "$candidate" ]] && print -u2 -r -- "  $candidate [index]"
+    done
     exit 1
   fi
 }

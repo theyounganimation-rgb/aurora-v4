@@ -24,10 +24,12 @@ struct AuroraDesktopApp: App {
                 onboardingMode: model.onboardingMode,
                 onboardingError: model.onboardingError,
                 restingWakeDetail: model.restingWakeDetail,
+                codexReadiness: model.codexReadiness,
                 onWake: model.wake,
                 onRest: model.rest,
                 onRequestVoiceKey: model.requestVoiceKey,
                 onRetry: model.retry,
+                onRefreshCodexReadiness: model.refreshCodexReadiness,
                 onOpenContinuity: {
                     model.refreshCompanionPairingCode()
                     showingContinuity = true

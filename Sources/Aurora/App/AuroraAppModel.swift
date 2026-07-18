@@ -51,6 +51,7 @@ final class AuroraAppModel: ObservableObject {
     @Published private(set) var onboardingMode: AuroraOnboardingMode?
     @Published private(set) var onboardingError: String?
     @Published private(set) var restingWakeDetail: String?
+    @Published private(set) var codexReadiness: DelegateTaskRuntimeReadiness = .checking
     @Published private(set) var companionPairingCode: String = ""
     @Published private(set) var companionStatus: String =
         "Private companion prototype excluded from this public release"
@@ -366,7 +367,8 @@ final class AuroraAppModel: ObservableObject {
             // Establish the shared ChatGPT/Codex transport while Aurora rests.
             // This is authentication/readiness only: it creates no model turn
             // and no owner-visible task.
-            await toolRegistry.prewarmDelegateTaskRuntime()
+            let readiness = await toolRegistry.prewarmDelegateTaskRuntime()
+            self?.codexReadiness = readiness
         }
         NotificationCenter.default.publisher(for: .auroraWindowWillClose)
             .receive(on: RunLoop.main)
@@ -401,6 +403,18 @@ final class AuroraAppModel: ObservableObject {
                 }
                 self.scheduleInnerLifeProjectionRefresh()
             }
+        }
+    }
+
+    func refreshCodexReadiness() {
+        guard codexReadiness != .checking else { return }
+        codexReadiness = .checking
+        let toolRegistry = self.toolRegistry
+        Task { [weak self, toolRegistry] in
+            let readiness = await toolRegistry.prewarmDelegateTaskRuntime(
+                forceReconnect: true
+            )
+            self?.codexReadiness = readiness
         }
     }
 

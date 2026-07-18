@@ -16,6 +16,7 @@ INFO_PLIST="$ROOT/Resources/Info.plist"
 ENTITLEMENTS="${AURORA_ENTITLEMENTS_PATH:-$ROOT/Resources/Aurora.entitlements}"
 SOURCE_FINGERPRINT_HELPER="$ROOT/scripts/source-fingerprint.sh"
 VERIFICATION_SCRIPT="$ROOT/scripts/verify.sh"
+PUBLIC_RELEASE_SCANNER="$ROOT/scripts/verify-public-release.sh"
 VERIFIED_SOURCE_STAMP="$ROOT/.build/aurora-verified-source-fingerprint"
 SIGNING_IDENTITY="${AURORA_SIGNING_IDENTITY:-}"
 NOTARY_PROFILE="${AURORA_NOTARY_PROFILE:-}"
@@ -39,6 +40,7 @@ done
 [[ -f "$ENTITLEMENTS" ]] || fail "missing signing entitlements at $ENTITLEMENTS"
 [[ -f "$SOURCE_FINGERPRINT_HELPER" ]] || fail "missing scripts/source-fingerprint.sh"
 [[ -x "$VERIFICATION_SCRIPT" ]] || fail "missing executable scripts/verify.sh"
+[[ -x "$PUBLIC_RELEASE_SCANNER" ]] || fail "missing executable scripts/verify-public-release.sh"
 plutil -lint "$INFO_PLIST" >/dev/null
 plutil -lint "$ENTITLEMENTS" >/dev/null
 
@@ -55,6 +57,12 @@ require_usage_description() {
 # of users' hands by rejecting an incomplete bundle before compilation.
 require_usage_description NSMicrophoneUsageDescription
 require_usage_description NSSpeechRecognitionUsageDescription
+
+# Prove the working tree and every exact compilation input are free of private
+# paths and credential-like literals before freezing the package snapshot.
+# This includes locally ignored files under Sources/Resources that Git-only
+# release scans would otherwise miss.
+AURORA_SCAN_PACKAGING_INPUTS=1 "$PUBLIC_RELEASE_SCANNER" >/dev/null
 
 # Symptom-level patches previously reached the installed app without proving
 # that Aurora's other control paths still worked. Release packaging now has a

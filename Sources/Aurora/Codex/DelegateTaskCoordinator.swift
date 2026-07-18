@@ -150,6 +150,14 @@ struct DelegateTaskCoordinatorResult: Sendable, Equatable {
     let detail: String
 }
 
+enum DelegateTaskRuntimeReadiness: Sendable, Equatable {
+    case checking
+    case ready
+    case chatGPTSignInRequired
+    case durableRuntimeUnavailable
+    case unavailable
+}
+
 protocol CodexDelegateTaskRunning: Sendable {
     func setEventHandler(
         _ handler: (@Sendable (CodexTaskRuntimeEvent) -> Void)?
@@ -309,6 +317,18 @@ actor DelegateTaskCoordinator {
             defaultProjectDirectory
                 ?? Self.productionDefaultProjectDirectory(homeDirectory: standardizedHome)
         ).standardizedFileURL
+        if defaultProjectDirectory == nil,
+           ProcessInfo.processInfo.environment["AURORA_CODEX_PROJECT_ROOT"] == nil {
+            // A first-run installation has no Aurora source checkout. Give
+            // project/research work a stable, user-visible workspace that
+            // exists on every account instead of assuming a developer's
+            // repository path exists on another Mac.
+            try? FileManager.default.createDirectory(
+                at: self.defaultProjectDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
         let controlWorkspaceDirectory = standardizedHome
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
@@ -391,9 +411,25 @@ actor DelegateTaskCoordinator {
     /// Opens the authenticated shared Codex transport before the owner asks
     /// Aurora to act. This performs no model turn and creates no Codex thread;
     /// it only removes daemon/authentication cold start from the first task.
-    func prewarmRuntime() async {
+    func prewarmRuntime(
+        forceReconnect: Bool = false
+    ) async -> DelegateTaskRuntimeReadiness {
         await ensureRuntimeHandler()
-        _ = try? await runtime.supportsDetachedTaskPersistence()
+        if forceReconnect && !hasActiveTask() {
+            await runtime.shutdown()
+        }
+        do {
+            return try await runtime.supportsDetachedTaskPersistence()
+                ? .ready
+                : .durableRuntimeUnavailable
+        } catch let error as CodexTaskRuntimeError {
+            if case .chatGPTLoginRequired = error {
+                return .chatGPTSignInRequired
+            }
+            return .unavailable
+        } catch {
+            return .unavailable
+        }
     }
 
     /// Returns durable local truth without touching the Codex transport. Voice
@@ -469,7 +505,7 @@ actor DelegateTaskCoordinator {
         }
         if taskKind.continuesAfterVoiceRest {
             do {
-                guard try await runtime.supportsDetachedTaskPersistence() else {
+                guard try await supportsPersistentRuntimeWithOneSafeReconnect() else {
                     return remember(failure(
                         .executionFailed,
                         "Persistent work needs the shared Codex daemon; standalone fallback cannot keep it alive after Aurora closes."
@@ -1948,6 +1984,17 @@ actor DelegateTaskCoordinator {
         return try validatedWorkspace(candidate)
     }
 
+    /// Prewarming can occur before ChatGPT has launched, leaving Codex in its
+    /// truthful but non-durable standalone mode. Before rejecting the owner's
+    /// first persistent task, reset and probe once when no other task could be
+    /// disturbed. This is a transport retry, not a second model request.
+    private func supportsPersistentRuntimeWithOneSafeReconnect() async throws -> Bool {
+        let firstProbe = try await runtime.supportsDetachedTaskPersistence()
+        guard !firstProbe, !hasActiveTask() else { return firstProbe }
+        await runtime.shutdown()
+        return try await runtime.supportsDetachedTaskPersistence()
+    }
+
     private func validatedWorkspace(_ rawURL: URL) throws -> URL {
         let candidate = rawURL.standardizedFileURL
             .resolvingSymlinksInPath()
@@ -1980,7 +2027,7 @@ actor DelegateTaskCoordinator {
         }
         return homeDirectory
             .appendingPathComponent("Documents", isDirectory: true)
-            .appendingPathComponent("Aurora V4", isDirectory: true)
+            .appendingPathComponent("Aurora Projects", isDirectory: true)
     }
 
     private func remember(

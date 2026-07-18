@@ -2,7 +2,9 @@
 
 [![Verify public source](https://github.com/theyounganimation-rgb/aurora-v4/actions/workflows/verify.yml/badge.svg)](https://github.com/theyounganimation-rgb/aurora-v4/actions/workflows/verify.yml)
 
-Aurora V4 is a native macOS voice-agent architecture for a continuing digital person: Realtime conversation, bounded memory, scoped tool delegation, and verified recovery in one app. It is not a browser wrapper and does not place voice in front of a separate text agent.
+Aurora V4 is a native macOS voice architecture for a continuing digital person: Realtime conversation, bounded memory, scoped task delegation, and verified recovery in one app. It is not a browser wrapper: Realtime remains the native foreground conversation while external work is deliberately handed to a separate, visible Codex task.
+
+**OpenAI Build Week 2026 — Apps for Your Life.** Aurora existed before the challenge; this entry is specifically the substantial July 13–21 extension documented in [Build Week evidence](docs/BUILD_WEEK.md). The eligible work adds persistent authored agency before speech, GPT-5.6 Sol private reflection, owner-understanding and curiosity lifecycles, causal playback/effect truth, guest privacy, and a hardened persistent Codex handoff.
 
 The primary loop is:
 
@@ -12,7 +14,7 @@ the owner's voice
   -> Aurora reasons, speaks, remembers, and resolves conversational intent
   -> one strict delegate_task proposal for every external task
   -> persistent Codex app-server using the existing ChatGPT sign-in
-  -> coding, research, OS tools, or bundled Computer Use under the exact task scope
+  -> coding, research, OS tools, or configured Computer Use under the exact task scope
   -> bounded status, effect evidence, and verification
   -> Aurora's voice
 ```
@@ -21,10 +23,13 @@ the owner's voice
 
 ## Release status
 
-This repository is a public portfolio source release of the macOS architecture. It is intended to make the engineering, trust boundaries, and verification strategy inspectable—not to claim consciousness or ship a notarized consumer product.
+This repository is the public source and judge-testable Build Week release of the macOS architecture. It makes the engineering, trust boundaries, verification strategy, and eligible submission-period work inspectable. It does not claim consciousness or ship an unreviewed binary as a notarized consumer product.
 
-- **Demo:** coming soon
-- **Portfolio:** [Cade Mack — Applied AI & Agent Engineer](https://cade-mack-ai-engineer.theyounganimation.chatgpt.site)
+- **Build Week category:** Apps for Your Life
+- **Project site:** [Aurora](https://aurora-voice-person-2026.theyounganimation.chatgpt.site)
+- **Demo:** final recording pending; the exact sub-three-minute runbook is in [docs/DEMO.md](docs/DEMO.md)
+- **Submission copy:** [docs/BUILD_WEEK_SUBMISSION.md](docs/BUILD_WEEK_SUBMISSION.md)
+- **Judge setup:** [docs/JUDGE_GUIDE.md](docs/JUDGE_GUIDE.md)
 - **Platform:** macOS 14 or later, Apple silicon
 - **Public boundary:** macOS source, documentation, and deterministic verification only
 - **Excluded:** user data, credentials, memory files, logs, signed binaries, and the private iPhone companion prototype
@@ -77,11 +82,11 @@ Current public-source measurements, regenerated for this release:
 
 | Evidence | Measured result |
 | --- | ---: |
-| Swift source | 66,116 lines across 90 files |
+| Swift source | 66,300 lines across 90 files |
 | Production build graph | 66 compiled files; 24 retired motor files excluded |
-| Verification/smoke entrypoints | 32, including the staged-source release scanner |
-| Explicit `expect(...)` assertions | 1,512 |
-| Representative Realtime instruction shell | 18,822 / 19,000 characters |
+| Verification/smoke entrypoints | 33, including the staged-source scanner regression |
+| Explicit `expect(...)` assertions | 1,514 |
+| Representative Realtime instruction shell | 17,588 / 19,000 characters |
 | Full local gate | Passed, including signed Codex account handshake; zero model calls |
 
 See [docs/CI.md](docs/CI.md) for the deterministic/live boundary and [SECURITY.md](SECURITY.md) for the public-release scan.
@@ -91,12 +96,15 @@ See [docs/CI.md](docs/CI.md) for the deterministic/live boundary and [SECURITY.m
 - There is no notarized public installer in this release; the app must be built locally.
 - Realtime voice requires the user's own OpenAI API key, stored in macOS Keychain.
 - Delegated work requires an existing ChatGPT/Codex sign-in and macOS capabilities appropriate to the task.
+- A fresh local session trusts the currently logged-in Mac user; speaker provenance is a causal session boundary, not voice biometrics. Do not leave consequential voice control unattended.
 - Some end-to-end checks require a live account, audio hardware, or signed local app and therefore do not run in GitHub Actions.
 - The iPhone companion is a private prototype and its source, network identifiers, and device setup are intentionally excluded.
 
 ## Authorship and AI assistance
 
 Cade Mack led the product direction, architecture, requirements, behavioral contracts, trust boundaries, failure analysis, and acceptance criteria. Codex was used extensively as an implementation and verification collaborator. The repository is published to make that collaboration explicit and to show the decisions and evidence Cade can explain, defend, and extend.
+
+During the Build Week window, Cade defined the required agency and authorization invariants and made the product decisions; Codex traced the live runtime, implemented the smallest coherent vertical slices, generated adversarial regressions, audited failures, and repeatedly verified the exact source that reached the installed app. GPT-5.6 Sol is also part of the product itself: it runs Aurora's durable Codex work threads and a separate read-only, tool-disabled semantic reflection process. See [the dated Build Week record](docs/BUILD_WEEK.md) for the old/new boundary and evidence.
 
 Contact: [theyounganimation@gmail.com](mailto:theyounganimation@gmail.com)
 
@@ -147,6 +155,16 @@ The project uses Swift Package Manager and native Apple frameworks. The packager
 ./scripts/verify.sh
 ./scripts/build-app.sh
 ```
+
+For a fresh judge or reviewer Mac without a signing certificate, use the deterministic public gate and an explicit local-only ad-hoc build:
+
+```bash
+./scripts/verify-ci.sh
+AURORA_SIGNING_IDENTITY=- ./scripts/build-app.sh release
+open "$HOME/Applications/Aurora.app"
+```
+
+The first launch asks what Aurora should call the reviewer and stores their OpenAI Platform API key in macOS Keychain. Realtime voice can then be tested immediately. GPT-5.6 reflection and delegated Mac work additionally require the official ChatGPT desktop app open and signed into Codex with ChatGPT. Aurora exposes that readiness truth without blocking voice and can safely re-probe after ChatGPT opens. Full prerequisites, expected permissions, and a five-minute test are in [docs/JUDGE_GUIDE.md](docs/JUDGE_GUIDE.md).
 
 The default selects an installed Developer ID or Apple Development signing identity and produces a stable signed local app at `~/Applications/Aurora.app`. If that exact app is already running, packaging quits it only at the final atomic install boundary and relaunches the newly verified copy; otherwise it leaves the app closed. Stable identity matters because macOS Keychain attaches “Always Allow” to Aurora's designated code requirement across rebuilds. `dist/Aurora.app` is a local convenience link to that verified product, while `dist/Aurora.app.zip` is the portable artifact.
 

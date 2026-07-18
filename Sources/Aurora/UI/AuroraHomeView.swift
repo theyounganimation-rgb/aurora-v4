@@ -14,11 +14,13 @@ struct AuroraHomeView: View {
     let onboardingMode: AuroraOnboardingMode?
     let onboardingError: String?
     let restingWakeDetail: String?
+    let codexReadiness: DelegateTaskRuntimeReadiness
 
     let onWake: () -> Void
     let onRest: () -> Void
     let onRequestVoiceKey: () -> Void
     let onRetry: () -> Void
+    let onRefreshCodexReadiness: () -> Void
     let onOpenContinuity: () -> Void
     let onCompleteOnboarding: (_ displayName: String, _ apiKey: String) -> Void
     let onCancelOnboarding: () -> Void
@@ -90,6 +92,16 @@ struct AuroraHomeView: View {
                             .frame(maxWidth: 280)
                             .transition(.opacity.combined(with: .move(edge: .top)))
                     }
+
+                    if showsCodexReadiness {
+                        CodexReadinessRow(
+                            readiness: codexReadiness,
+                            showsDetail: false,
+                            onRefresh: onRefreshCodexReadiness
+                        )
+                        .frame(maxWidth: 300)
+                        .padding(.top, 5)
+                    }
                 }
                 .padding(.top, 22)
                 .animation(.easeInOut(duration: 0.28), value: phase)
@@ -133,6 +145,8 @@ struct AuroraHomeView: View {
                     mode: onboardingMode,
                     existingOwnerDisplayName: ownerDisplayName,
                     errorMessage: onboardingError,
+                    codexReadiness: codexReadiness,
+                    onRefreshCodexReadiness: onRefreshCodexReadiness,
                     onComplete: onCompleteOnboarding,
                     onCancel: onCancelOnboarding
                 )
@@ -163,6 +177,12 @@ struct AuroraHomeView: View {
         default:
             return nil
         }
+    }
+
+    private var showsCodexReadiness: Bool {
+        guard onboardingMode == nil else { return false }
+        if case .resting = phase { return true }
+        return false
     }
 
     private var accessibilityState: String {
@@ -228,6 +248,8 @@ private struct AuroraOnboardingPanel: View {
     let mode: AuroraOnboardingMode
     let existingOwnerDisplayName: String
     let errorMessage: String?
+    let codexReadiness: DelegateTaskRuntimeReadiness
+    let onRefreshCodexReadiness: () -> Void
     let onComplete: (_ displayName: String, _ apiKey: String) -> Void
     let onCancel: () -> Void
 
@@ -244,12 +266,16 @@ private struct AuroraOnboardingPanel: View {
         mode: AuroraOnboardingMode,
         existingOwnerDisplayName: String,
         errorMessage: String?,
+        codexReadiness: DelegateTaskRuntimeReadiness,
+        onRefreshCodexReadiness: @escaping () -> Void,
         onComplete: @escaping (_ displayName: String, _ apiKey: String) -> Void,
         onCancel: @escaping () -> Void
     ) {
         self.mode = mode
         self.existingOwnerDisplayName = existingOwnerDisplayName
         self.errorMessage = errorMessage
+        self.codexReadiness = codexReadiness
+        self.onRefreshCodexReadiness = onRefreshCodexReadiness
         self.onComplete = onComplete
         self.onCancel = onCancel
         _displayName = State(initialValue: mode == .firstRun ? "" : existingOwnerDisplayName)
@@ -321,6 +347,12 @@ private struct AuroraOnboardingPanel: View {
                     .font(.system(size: 11, weight: .regular, design: .rounded))
                     .foregroundStyle(.white.opacity(0.42))
                     .fixedSize(horizontal: false, vertical: true)
+
+                CodexReadinessRow(
+                    readiness: codexReadiness,
+                    showsDetail: true,
+                    onRefresh: onRefreshCodexReadiness
+                )
 
                 if let errorMessage, !errorMessage.isEmpty {
                     Text(errorMessage)
@@ -407,6 +439,91 @@ private struct AuroraOnboardingPanel: View {
     private func submit() {
         guard canSubmit else { return }
         onComplete(displayName, apiKey)
+    }
+}
+
+private struct CodexReadinessRow: View {
+    let readiness: DelegateTaskRuntimeReadiness
+    let showsDetail: Bool
+    let onRefresh: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Circle()
+                .fill(readiness.tint)
+                .frame(width: 6, height: 6)
+                .shadow(color: readiness.tint.opacity(0.65), radius: 4)
+                .padding(.top, 4)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(readiness.title)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.68))
+                if showsDetail {
+                    Text(readiness.detail)
+                        .font(.system(size: 9.5, weight: .regular, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.38))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            if readiness.canRefresh {
+                Button("Check again", action: onRefresh)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Color(red: 0.72, green: 0.66, blue: 1.0))
+            }
+        }
+        .padding(.horizontal, showsDetail ? 11 : 0)
+        .padding(.vertical, showsDetail ? 9 : 0)
+        .background(
+            showsDetail ? Color.white.opacity(0.045) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Codex status: \(readiness.title). \(readiness.detail)")
+    }
+}
+
+private extension DelegateTaskRuntimeReadiness {
+    var title: String {
+        switch self {
+        case .checking: return "Checking ChatGPT and Codex…"
+        case .ready: return "Codex ready for persistent tasks"
+        case .chatGPTSignInRequired: return "ChatGPT sign-in needed"
+        case .durableRuntimeUnavailable: return "Open ChatGPT for persistent tasks"
+        case .unavailable: return "Codex tasks unavailable"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .checking:
+            return "Aurora's voice remains available while this is checked."
+        case .ready:
+            return "GPT-5.6 Codex can keep working in a visible thread while Aurora talks or rests."
+        case .chatGPTSignInRequired:
+            return "Open the official ChatGPT app, sign into Codex with ChatGPT, then check again."
+        case .durableRuntimeUnavailable:
+            return "Open the official ChatGPT app and leave it running, then check again."
+        case .unavailable:
+            return "Confirm the official ChatGPT app is installed and Codex is available, then check again."
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .ready: return Color(red: 0.46, green: 0.90, blue: 0.72)
+        case .checking: return Color(red: 0.72, green: 0.66, blue: 1.0)
+        case .chatGPTSignInRequired, .durableRuntimeUnavailable, .unavailable:
+            return Color(red: 1.0, green: 0.67, blue: 0.42)
+        }
+    }
+
+    var canRefresh: Bool {
+        self != .ready && self != .checking
     }
 }
 
