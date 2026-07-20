@@ -27,3 +27,17 @@ Run the same public check locally with:
 
 `scripts/verify.sh` keeps the signed account handshake enabled by default for
 the private local release gate.
+
+Two paid/networked probes remain explicit local opt-ins and are never run by
+CI or the deterministic release gate:
+
+```bash
+AURORA_PROBE_PROJECT_CHAT=1 ./scripts/run-live-conversation-probe.sh
+./scripts/run-live-codex-app-bridge.sh
+```
+
+The first makes one Realtime planning call and verifies that an explicit named
+project request selects `codex_project_chat` with the strict nullable schema;
+it performs no external effect. The second makes one read-only GPT-5.6 Sol
+Codex turn through the signed ChatGPT app-server, verifies task visibility and
+recovery, then archives its probe task.

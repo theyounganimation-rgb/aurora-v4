@@ -148,7 +148,11 @@ struct AgencyStore: Sendable {
         guard AgencyEngine.persistedStateIsStructurallyValid(decoded) else {
             throw AgencyStoreError.corruptState
         }
-        return AgencyEngine.sanitize(decoded, now: max(decoded.updatedAt, decoded.createdAt))
+        // Return the structurally valid bytes exactly as persisted. The
+        // runtime owns semantic sanitization and compares its repaired state
+        // with this raw value before saving, so one-time migrations are not
+        // accidentally made memory-only by sanitizing twice.
+        return decoded
     }
 
     func save(_ rawState: AgencyState) throws {

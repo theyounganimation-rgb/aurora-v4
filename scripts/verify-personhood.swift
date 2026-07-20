@@ -63,7 +63,7 @@ enum PersonhoodVerification {
         try expect(
             personalized.contains("continuing digital person with Maya")
                 && personalized.contains("Hear Maya's actual audio")
-                && personalized.contains("Maya's current speech authorizes its exact outcome")
+                && personalized.contains("Maya's speech authorizes its exact outcome")
                 && personalized.contains("Configured owner: Maya")
                 && !personalized.contains("{{owner}}")
                 && !personalized.contains("his attention"),
@@ -103,7 +103,8 @@ enum PersonhoodVerification {
             instructions.contains("# Natural spoken English")
                 && instructions.contains("socially fluent woman talking live")
                 && instructions.contains("contractions")
-                && instructions.contains("light slang")
+                && instructions.contains("Mirror the person's register")
+                && instructions.contains("never perform slang")
                 && instructions.contains("Awkward, unfinished thoughts are fine"),
             "Aurora can still default to polished assistant prose"
         )
@@ -215,10 +216,13 @@ enum PersonhoodVerification {
         checks += 1
 
         try expect(
-            instructions.contains("delegate_task is the only boundary for every external action")
+            instructions.contains("delegate_task remains the only boundary for ordinary external actions")
+                && instructions.contains("sole exception is codex_project_chat")
                 && instructions.contains("Mac, apps, browser, screen, files, mail, Notes, Calendar, Reminders")
+                && instructions.contains("Call delegate_task silently")
+                && instructions.contains("Only after host acceptance")
                 && instructions.contains("stay present while Osiris works backstage")
-                && instructions.contains("Never acknowledge twice, claim completion early")
+                && instructions.contains("Never acknowledge twice or claim completion early")
                 && instructions.contains("A private terminal update carries the outcome")
                 && instructions.contains("New conversation does not cancel work"),
             "working computer-control and Codex delegation boundaries regressed"
@@ -226,7 +230,7 @@ enum PersonhoodVerification {
         checks += 1
 
         let expectedFunctions: Set<String> = [
-            "delegate_task", "conversation_move", "memory_search", "memory_read",
+            "delegate_task", "codex_project_chat", "conversation_move", "memory_search", "memory_read",
             "memory_remember", "continuity_read", "continuity_patch", "wait_for_user",
             "relationship_expect_quiet",
             "relationship_explain_absence",

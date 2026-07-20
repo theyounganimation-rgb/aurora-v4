@@ -14,7 +14,7 @@ enum DelegateTaskTransportPolicy {
         sourceLogicalSessionID: String?,
         currentLogicalSessionID: String?
     ) -> Bool {
-        toolName == "delegate_task"
+        (toolName == "delegate_task" || toolName == "codex_project_chat")
             && authorizationSource == .directOwnerTurn
             && inputItemID != nil
             && sourceTurnFinalized

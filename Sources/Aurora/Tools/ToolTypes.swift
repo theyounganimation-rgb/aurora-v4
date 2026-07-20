@@ -82,6 +82,7 @@ public struct RealtimeFunctionSchema: Codable, Sendable, Equatable {
 public enum ToolEvidencePolicy {
     private static let finalizedTranscriptTools: Set<String> = [
         "delegate_task",
+        "codex_project_chat",
         "conversation_move",
         "memory_search",
         "memory_read",
@@ -320,6 +321,15 @@ enum ConversationAnswerDegree: String, Sendable, Equatable {
     case direct
 }
 
+/// Realtime's semantic classification of the finalized owner turn. The host
+/// does not infer this from words or app-name grammar; it validates that the
+/// function Realtime selected agrees with Realtime's own structured intent.
+enum ConversationTurnDomain: String, CaseIterable, Sendable, Equatable {
+    case social
+    case delegatedAction = "delegated_action"
+    case codexProjectChat = "codex_project_chat"
+}
+
 /// One Realtime-authored revision to Aurora's own point of view. Natural
 /// language is resolved by Realtime; the host binds every accepted proposal to
 /// exact source IDs and validates the bounded agency transition.
@@ -345,6 +355,7 @@ struct ConversationMoveRecordUpdate: Sendable, Equatable {
 /// ToolRegistry validates the schema and the agency runtime validates current
 /// IDs, revisions, disclosure eligibility, and playback binding.
 struct ConversationMoveToolProposal: Sendable, Equatable {
+    let turnDomain: ConversationTurnDomain
     let perceivedTurn: String
     let interactionKind: AgencyOwnerInteractionKind
     let proposedMove: AgencyAuthoredMoveType
@@ -355,6 +366,32 @@ struct ConversationMoveToolProposal: Sendable, Equatable {
     let disclosureRecordID: String?
     let recordUpdates: [ConversationMoveRecordUpdate]
     let ownerUnderstandingUpdates: [OwnerUnderstandingToolUpdate]
+
+    init(
+        turnDomain: ConversationTurnDomain = .social,
+        perceivedTurn: String,
+        interactionKind: AgencyOwnerInteractionKind,
+        proposedMove: AgencyAuthoredMoveType,
+        answerDegree: ConversationAnswerDegree,
+        authoredPosition: String,
+        privateRationale: String,
+        recordIDs: [String],
+        disclosureRecordID: String?,
+        recordUpdates: [ConversationMoveRecordUpdate],
+        ownerUnderstandingUpdates: [OwnerUnderstandingToolUpdate]
+    ) {
+        self.turnDomain = turnDomain
+        self.perceivedTurn = perceivedTurn
+        self.interactionKind = interactionKind
+        self.proposedMove = proposedMove
+        self.answerDegree = answerDegree
+        self.authoredPosition = authoredPosition
+        self.privateRationale = privateRationale
+        self.recordIDs = recordIDs
+        self.disclosureRecordID = disclosureRecordID
+        self.recordUpdates = recordUpdates
+        self.ownerUnderstandingUpdates = ownerUnderstandingUpdates
+    }
 }
 
 typealias ConversationMoveHandler = @Sendable (

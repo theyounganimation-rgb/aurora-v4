@@ -32,6 +32,18 @@ enum DelegateTransportVerifier {
         )
         try expect(durable, "a finalized direct-owner delegate was not durable")
         try expect(
+            DelegateTaskTransportPolicy.isDurableDelegate(
+                toolName: "codex_project_chat",
+                authorizationSource: .directOwnerTurn,
+                inputItemID: "owner-project-audio-item",
+                sourceTurnFinalized: true,
+                wantsAwake: true,
+                sourceLogicalSessionID: session,
+                currentLogicalSessionID: session
+            ),
+            "a finalized direct-owner Codex project relay was not durable"
+        )
+        try expect(
             DelegateTaskTransportPolicy.mayExecuteAcrossTransportBoundary(
                 callConnectionID: oldConnection,
                 activeConnectionID: newConnection,

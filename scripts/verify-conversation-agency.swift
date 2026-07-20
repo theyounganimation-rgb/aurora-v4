@@ -124,6 +124,7 @@ private struct ConversationAgencyVerification {
             try verifyGroundingRevisionPrivacyAndRelationalBalance()
             try await verifyPlaybackAndRestartTruth()
             try await verifyAtomicConversationMovePreparation()
+            try await verifyOneTurnFallbackAndSemanticReroute()
             try await verifyDelayedStaleConversationMoveCompletion()
             try await verifyCuriosityPlaybackBridge()
             try await verifyExistingCuriosityPlaybackBridge()
@@ -854,6 +855,179 @@ private struct ConversationAgencyVerification {
                 && afterRejectedRetry == baseline
                 && understandingAfterRejectedRetry == understandingBaseline,
             "a rejected conversation_move left a durable interaction, record, move, or owner-learning mutation"
+        )
+    }
+
+    private static func verifyOneTurnFallbackAndSemanticReroute() async throws {
+        let root = try temporaryRoot("one-turn-fallback")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let agency = AuroraAgencyRuntime(
+            store: AgencyStore(fileURL: root.appendingPathComponent("agency/state.json")),
+            now: { start.addingTimeInterval(55) }
+        )
+        let understanding = AuroraOwnerUnderstandingRuntime(
+            store: OwnerUnderstandingStore(
+                fileURL: root.appendingPathComponent("understanding/state.json")
+            ),
+            now: { start.addingTimeInterval(55) }
+        )
+        _ = await agency.start()
+        _ = await understanding.start()
+
+        let social = await ConversationMoveAdapter.execute(
+            ConversationMoveToolProposal(
+                perceivedTurn: "greeting",
+                interactionKind: .warmth,
+                proposedMove: .initiateThread,
+                answerDegree: .none,
+                authoredPosition: "I want to greet him and leave one small opening.",
+                privateRationale: "This belongs only to the immediate greeting.",
+                recordIDs: [],
+                disclosureRecordID: nil,
+                recordUpdates: [],
+                ownerUnderstandingUpdates: []
+            ),
+            context: invocationContext(
+                callID: "one-turn-social-call",
+                sessionID: "one-turn-session",
+                transcript: "Hello.",
+                audioItemID: "one-turn-owner-audio",
+                responseID: "one-turn-social-response"
+            ),
+            agency: agency,
+            ownerUnderstanding: understanding,
+            signals: expressiveSignals,
+            at: start.addingTimeInterval(56)
+        )
+        let afterSocial = try require(
+            await agency.snapshot().state,
+            "one-turn fallback did not persist its immediate move"
+        )
+        let fallback = try require(
+            afterSocial.records.first(where: {
+                $0.authoringSourceID.hasPrefix("conversation-position-")
+            }),
+            "conversation_move did not create its immediate fallback position"
+        )
+        let nextProjection = await agency.projection(signals: expressiveSignals).text
+        try expect(
+            social.ok
+                && social.output.contains("I want to greet him")
+                && !fallback.projectionEligible
+                && !nextProjection.contains(fallback.id)
+                && !nextProjection.contains("I want to greet him"),
+            "a one-turn fallback leaked into a later conversation projection"
+        )
+
+        let beforeMisroute = try require(
+            await agency.snapshot().state,
+            "agency state disappeared before semantic reroute"
+        )
+        let misroute = await ConversationMoveAdapter.execute(
+            ConversationMoveToolProposal(
+                turnDomain: .codexProjectChat,
+                perceivedTurn: "other",
+                interactionKind: .other,
+                proposedMove: .answer,
+                answerDegree: .none,
+                authoredPosition: "I need to work in the named Codex chat.",
+                privateRationale: "The owner selected a project-chat resource.",
+                recordIDs: [],
+                disclosureRecordID: nil,
+                recordUpdates: [],
+                ownerUnderstandingUpdates: []
+            ),
+            context: invocationContext(
+                callID: "misrouted-project-call",
+                sessionID: "one-turn-session",
+                transcript: "I want to work in Aurora V4.",
+                audioItemID: "misrouted-project-audio",
+                responseID: "misrouted-project-response"
+            ),
+            agency: agency,
+            ownerUnderstanding: understanding,
+            signals: expressiveSignals,
+            at: start.addingTimeInterval(57)
+        )
+        let afterMisroute = try require(
+            await agency.snapshot().state,
+            "agency state disappeared after semantic reroute"
+        )
+        try expect(
+            !misroute.ok
+                && misroute.metadata["result_code"]?.stringValue
+                    == "conversation_move_route_mismatch"
+                && misroute.metadata["semantic_retry_tool"]?.stringValue
+                    == "codex_project_chat"
+                && beforeMisroute == afterMisroute,
+            "a named Codex request reached social speech or mutated Agency instead of rerouting"
+        )
+
+        let migrationRoot = try temporaryRoot("fallback-migration")
+        defer { try? FileManager.default.removeItem(at: migrationRoot) }
+        let migrationStore = AgencyStore(
+            fileURL: migrationRoot.appendingPathComponent("agency/state.json")
+        )
+        var legacy = AgencyEngine.defaultState(at: start)
+        legacy = try AgencyEngine.createRecord(
+            legacy,
+            kind: .presentWant,
+            contentScope: .internalPosition,
+            content: "I could not pass that through, so I want a resend.",
+            privateRationale: "Legacy one-turn fallback fixture.",
+            groundings: [AgencyGroundingReference(
+                id: "legacy-fallback-grounding",
+                kind: .ownerTurn,
+                observedAt: start,
+                sourceSessionID: "legacy-fallback-session",
+                sourceTurnID: "legacy-fallback-turn"
+            )],
+            authoringSourceID: "conversation-position-legacy-call",
+            sourceSessionID: "legacy-fallback-session",
+            sourceTurnIDs: ["legacy-fallback-turn"],
+            expiresAt: start.addingTimeInterval(8 * 3_600),
+            confidence: 0.72,
+            salience: 0.62,
+            projectionEligible: true,
+            at: start
+        ).state
+        // Bypass AgencyStore.save: that path intentionally sanitizes current
+        // writes, while this fixture must represent bytes persisted by the
+        // older build before the one-time migration existed.
+        let migrationDirectory = migrationStore.fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: migrationDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let legacyEncoder = JSONEncoder()
+        legacyEncoder.dateEncodingStrategy = .iso8601
+        legacyEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try legacyEncoder.encode(legacy).write(
+            to: migrationStore.fileURL,
+            options: .atomic
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: migrationStore.fileURL.path
+        )
+        let migratedRuntime = AuroraAgencyRuntime(
+            store: migrationStore,
+            now: { start.addingTimeInterval(60) }
+        )
+        let migrated = try require(
+            await migratedRuntime.start().state,
+            "legacy fallback migration failed to load"
+        )
+        let migratedOnDisk = try require(
+            migrationStore.load(),
+            "legacy fallback migration was not persisted"
+        )
+        try expect(
+            migrated.records.count == 1
+                && migrated.records[0].projectionEligible == false
+                && migratedOnDisk.records[0].projectionEligible == false,
+            "legacy conversation-position state remained eligible after restart"
         )
     }
 
@@ -1740,6 +1914,7 @@ private struct ConversationAgencyVerification {
 
         let requiredSchemaTokens = [
             "name: \"conversation_move\"",
+            "\"turn_domain\"",
             "\"perceived_turn\"",
             "\"interaction_kind\"",
             "\"proposed_move\"",
@@ -1755,6 +1930,7 @@ private struct ConversationAgencyVerification {
         )
         try expect(
             realtime.contains("wantsConversationMove")
+                && realtime.contains("semantic_route_retry_once")
                 && realtime.contains("conversation_move_once")
                 && realtime.contains("The result is private direction")
                 && realtime.contains("ordinary speech still cannot bypass conversation_move"),
@@ -1767,6 +1943,9 @@ private struct ConversationAgencyVerification {
                     "every ordinary social turn call conversation_move exactly once"
                 )
                 && instructionLower.contains("do not emit audio first")
+                && instructionLower.contains(
+                    "a named codex project/chat request is never ordinary conversation"
+                )
                 && instructionLower.contains("before speech"),
             "the foreground voice contract no longer requires a pre-speech social decision"
         )

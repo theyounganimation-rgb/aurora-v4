@@ -66,6 +66,12 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
     private var turnCounter = 0
     private var failsToStart: Bool
     private var threadReadResponses: [[String: Any]] = []
+    private var threadListResponses: [[String: Any]] = []
+    private var threadTurnsListResponses: [[String: Any]] = []
+    private var simulatesOversizedHistoryOnIncludeTurns = false
+    private var nextTurnStartError: [String: Any]?
+    private var nextTurnSteerError: [String: Any]?
+    private var completeNextTurnBeforeStartResponse = false
 
     init(
         accountMode: AccountMode = .chatGPT,
@@ -141,21 +147,59 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
         case "thread/read":
             let params = object["params"] as? [String: Any] ?? [:]
             let threadID = params["threadId"] as? String ?? "missing"
+            if simulatesOversizedHistoryOnIncludeTurns,
+               params["includeTurns"] as? Bool == true {
+                respond(id: id, result: [
+                    "thread": desktopThread(
+                        threadID: threadID,
+                        turns: [[
+                            "id": "turn-oversized-history",
+                            "status": "completed",
+                            "items": [[
+                                "id": "item-oversized-history",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": String(repeating: "x", count: 256 * 1_024),
+                            ]],
+                        ]]
+                    ),
+                ])
+                return
+            }
             let response = threadReadResponses.isEmpty
                 ? [
-                    "thread": [
-                        "id": threadID,
-                        "name": NSNull(),
-                        "cwd": "/verification/Aurora V4",
-                        "status": ["type": "notLoaded"],
-                        "turns": [],
-                    ],
+                    "thread": desktopThread(threadID: threadID, turns: []),
                 ]
                 : threadReadResponses.removeFirst()
             respond(id: id, result: response)
+        case "thread/turns/list":
+            let response = threadTurnsListResponses.isEmpty
+                ? [
+                    "data": [],
+                    "nextCursor": NSNull(),
+                    "backwardsCursor": NSNull(),
+                ]
+                : threadTurnsListResponses.removeFirst()
+            respond(id: id, result: response)
+        case "thread/list":
+            let response = threadListResponses.isEmpty
+                ? [
+                    "data": [desktopThread(threadID: "thread-1", turns: [])],
+                    "nextCursor": NSNull(),
+                    "backwardsCursor": "previous-page",
+                ]
+                : threadListResponses.removeFirst()
+            respond(id: id, result: response)
         case "thread/name/set":
             respond(id: id, result: [:])
+        case "thread/archive", "thread/unarchive":
+            respond(id: id, result: [:])
         case "turn/start":
+            if let error = nextTurnStartError {
+                nextTurnStartError = nil
+                respond(id: id, error: error)
+                return
+            }
             turnCounter += 1
             let params = object["params"] as? [String: Any]
             let threadID = params?["threadId"] as? String ?? "missing"
@@ -164,10 +208,31 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
                 "threadId": threadID,
                 "turn": ["id": turnID, "status": "inProgress"],
             ])
+            if completeNextTurnBeforeStartResponse {
+                completeNextTurnBeforeStartResponse = false
+                notify(method: "turn/completed", params: [
+                    "threadId": threadID,
+                    "turn": [
+                        "id": turnID,
+                        "status": "completed",
+                        "items": [[
+                            "id": "fast-runtime-final",
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "The fast runtime turn completed.",
+                        ]],
+                    ],
+                ])
+            }
             respond(id: id, result: [
                 "turn": ["id": turnID, "items": [], "status": "inProgress"],
             ])
         case "turn/steer":
+            if let error = nextTurnSteerError {
+                nextTurnSteerError = nil
+                respond(id: id, error: error)
+                return
+            }
             let params = object["params"] as? [String: Any]
             respond(id: id, result: ["turnId": params?["expectedTurnId"] as? String ?? "missing"])
         case "turn/interrupt":
@@ -243,6 +308,30 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
         threadReadResponses = responses
     }
 
+    func setThreadListResponses(_ responses: [[String: Any]]) {
+        threadListResponses = responses
+    }
+
+    func setThreadTurnsListResponses(_ responses: [[String: Any]]) {
+        threadTurnsListResponses = responses
+    }
+
+    func simulateOversizedHistoryOnIncludeTurns() {
+        simulatesOversizedHistoryOnIncludeTurns = true
+    }
+
+    func failNextTurnStart(code: Int = -32_000, message: String) {
+        nextTurnStartError = ["code": code, "message": message]
+    }
+
+    func failNextTurnSteer(code: Int = -32_000, message: String) {
+        nextTurnSteerError = ["code": code, "message": message]
+    }
+
+    func completeNextTurnBeforeReturningStartHandle() {
+        completeNextTurnBeforeStartResponse = true
+    }
+
     func setFailsToStart(_ fails: Bool) {
         failsToStart = fails
     }
@@ -279,7 +368,7 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
             sandbox["excludeTmpdirEnvVar"] = false
             sandbox["excludeSlashTmp"] = false
         }
-        let requestedCWD = params["cwd"] as? String ?? "/verification"
+        let requestedCWD = params["cwd"] as? String ?? "/verification/Aurora V4"
         let cwd = boundaryMode == .wrongWorkingDirectory
             ? "/verification/unrelated"
             : requestedCWD
@@ -292,6 +381,28 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
             "approvalsReviewer": "user",
             "sandbox": sandbox,
             "activePermissionProfile": NSNull(),
+        ]
+    }
+
+    private func desktopThread(
+        threadID: String,
+        turns: [[String: Any]]
+    ) -> [String: Any] {
+        [
+            "id": threadID,
+            "sessionId": "session-1",
+            "name": "Aurora — Open Notes",
+            "preview": "Open Notes",
+            "cwd": "/verification/Aurora V4",
+            "status": ["type": "notLoaded"],
+            "source": "appServer",
+            "threadSource": "appServer",
+            "modelProvider": "openai",
+            "cliVersion": "0.144.5",
+            "createdAt": 1_700_000_000,
+            "updatedAt": 1_700_000_001,
+            "ephemeral": false,
+            "turns": turns,
         ]
     }
 
@@ -312,6 +423,8 @@ private enum CodexTaskRuntimeVerifier {
     static func main() async {
         do {
             try await verifyLifecycleAndServerRequests()
+            try await verifyRawProjectThreadMessaging()
+            try await verifyExactProjectThreadReconciliation()
             try await verifyRestartResumesMappedThread()
             try await verifyReconciliationClosesReadSubscribeRace()
             try await verifyBrowserSurfaceReceiptRecovery()
@@ -332,7 +445,7 @@ private enum CodexTaskRuntimeVerifier {
             }
             let payload: [String: Any] = [
                 "ok": true,
-                "checks": 95,
+                "checks": 123,
                 "liveAccountHandshake": liveHandshakeRequested,
                 "liveSharedDaemonHandshake": liveSharedDaemonHandshake,
                 "realModelCalls": 0,
@@ -397,6 +510,31 @@ private enum CodexTaskRuntimeVerifier {
                    "task-to-thread mapping was not retained")
         try expect(mappedTurnID == "turn-1",
                    "turn/started was not mapped to the task")
+        let desktopPage = try await runtime.listThreads(query: AuroraCodexThreadQuery(
+            searchTerm: "Open Notes",
+            workingDirectory: projectDirectory,
+            limit: 20
+        ))
+        try expect(
+            desktopPage.threads.count == 1
+                && desktopPage.threads[0].threadID == "thread-1"
+                && desktopPage.threads[0].name == "Aurora — Open Notes"
+                && desktopPage.threads[0].status == "notLoaded"
+                && desktopPage.nextCursor == nil,
+            "typed Codex thread discovery did not return the app-server thread"
+        )
+        let desktopDocument = try await runtime.readThread(
+            threadID: "thread-1",
+            includeTurns: true
+        )
+        try expect(
+            desktopDocument.summary.threadID == "thread-1"
+                && desktopDocument.canonicalThreadJSON.isEmpty == false,
+            "typed Codex thread/read did not preserve the bounded document"
+        )
+        try await waitUntil {
+            await desktopRegistrar.registrations().count == 1
+        }
         let registeredDesktopThreads = await desktopRegistrar.registrations()
         try expect(
             registeredDesktopThreads == ["thread-1"],
@@ -405,6 +543,41 @@ private enum CodexTaskRuntimeVerifier {
 
         try await runtime.steerTask(taskID: "owner.notes-demo", input: "Use the current window")
         let messages = try decodeMessages(await transport.messageData())
+        guard let initialize = messages.first(where: { $0["method"] as? String == "initialize" }),
+              let initializeParams = initialize["params"] as? [String: Any],
+              let capabilities = initializeParams["capabilities"] as? [String: Any] else {
+            throw VerificationFailure.failed("initialize capability negotiation was not sent")
+        }
+        try expect(
+            capabilities["experimentalApi"] as? Bool == true,
+            "runtime exposed dynamicTools without negotiating experimentalApi"
+        )
+        guard let threadList = messages.first(where: {
+            $0["method"] as? String == "thread/list"
+        }),
+              let threadListParams = threadList["params"] as? [String: Any],
+              let sourceKinds = threadListParams["sourceKinds"] as? [String],
+              let modelProviders = threadListParams["modelProviders"] as? [String]
+        else {
+            throw VerificationFailure.failed("thread/list discovery parameters were missing")
+        }
+        try expect(
+            Set(sourceKinds) == Set([
+                "cli",
+                "vscode",
+                "exec",
+                "appServer",
+                "subAgent",
+                "subAgentReview",
+                "subAgentCompact",
+                "subAgentThreadSpawn",
+                "subAgentOther",
+                "unknown",
+            ])
+                && modelProviders.isEmpty
+                && threadListParams["useStateDbOnly"] as? Bool == false,
+            "thread/list could hide Desktop-projected or stale Codex tasks"
+        )
         guard let threadStart = messages.first(where: { $0["method"] as? String == "thread/start" }),
               let threadParams = threadStart["params"] as? [String: Any] else {
             throw VerificationFailure.failed("thread/start was not sent")
@@ -576,7 +749,778 @@ private enum CodexTaskRuntimeVerifier {
                     == "minimal",
             "the live transport did not reuse auth or apply the continuation QoS override"
         )
+
+        try await runtime.renameThread(
+            threadID: "thread-1",
+            name: "Aurora — Renamed task"
+        )
+        try await runtime.archiveThread(threadID: "thread-1")
+        try await runtime.unarchiveThread(threadID: "thread-1")
+        let openedExistingThread = await runtime.openThreadInDesktop(
+            threadID: "thread-1"
+        )
+        let managementMessages = try decodeMessages(await transport.messageData())
+        let explicitRename = managementMessages.last(where: {
+            $0["method"] as? String == "thread/name/set"
+        })?["params"] as? [String: Any]
+        let archive = managementMessages.last(where: {
+            $0["method"] as? String == "thread/archive"
+        })?["params"] as? [String: Any]
+        let unarchive = managementMessages.last(where: {
+            $0["method"] as? String == "thread/unarchive"
+        })?["params"] as? [String: Any]
+        let managedRegistrations = await desktopRegistrar.registrations()
+        try expect(
+            explicitRename?["threadId"] as? String == "thread-1"
+                && explicitRename?["name"] as? String == "Aurora — Renamed task"
+                && archive?["threadId"] as? String == "thread-1"
+                && unarchive?["threadId"] as? String == "thread-1"
+                && openedExistingThread
+                && managedRegistrations == ["thread-1", "thread-1"],
+            "typed Codex task mutation or Desktop navigation lost its exact thread identity"
+        )
+        do {
+            try await runtime.renameThread(threadID: "thread-1", name: "  ")
+            throw VerificationFailure.failed("an empty Codex task name was accepted")
+        } catch CodexTaskRuntimeError.invalidInput {
+            // Expected.
+        }
+        let invalidThreadOpened = await runtime.openThreadInDesktop(
+            threadID: "not an opaque id"
+        )
+        try expect(
+            invalidThreadOpened == false,
+            "an invalid Codex task identity reached Desktop navigation"
+        )
         await runtime.shutdown()
+    }
+
+    private static func verifyRawProjectThreadMessaging() async throws {
+        let projectDirectory = URL(
+            fileURLWithPath: "/verification/Aurora V4",
+            isDirectory: true
+        )
+        let exactNewText = "Build the page exactly as we discussed — don’t add a wrapper."
+        let newTransport = FakeCodexAppServerTransport()
+        let newRuntime = makeRuntime(transport: newTransport)
+        let rawOptions = CodexTaskThreadOptions(
+            model: "gpt-5.6-sol",
+            reasoningEffort: .medium,
+            workingDirectory: projectDirectory,
+            approvalPolicy: .never,
+            sandboxMode: .dangerFullAccess,
+            threadName: "Owner-directed website task"
+        )
+        let newHandle = try await newRuntime.startRawProjectThread(
+            taskID: "project.new-site",
+            input: exactNewText,
+            options: rawOptions
+        )
+        try expect(
+            newHandle.threadID == "thread-1" && newHandle.turnID == "turn-1",
+            "raw project-thread creation lost its stable Codex identities"
+        )
+        let newMessages = try decodeMessages(await newTransport.messageData())
+        guard let rawThreadStart = newMessages.first(where: {
+            $0["method"] as? String == "thread/start"
+        }),
+              let rawThreadParams = rawThreadStart["params"] as? [String: Any],
+              let rawTurnStart = newMessages.first(where: {
+                  $0["method"] as? String == "turn/start"
+              }),
+              let rawTurnParams = rawTurnStart["params"] as? [String: Any],
+              let rawTurnInput = rawTurnParams["input"] as? [[String: Any]] else {
+            throw VerificationFailure.failed("raw project thread RPCs were missing")
+        }
+        try expect(
+            rawThreadParams["cwd"] as? String == projectDirectory.path
+                && rawThreadParams["ephemeral"] as? Bool == false
+                && rawThreadParams["developerInstructions"] == nil
+                && rawThreadParams["dynamicTools"] == nil
+                && rawTurnInput.first?["text"] as? String == exactNewText,
+            "new project conversation received Aurora scaffolding or modified owner text"
+        )
+        do {
+            _ = try await newRuntime.startRawProjectThread(
+                taskID: "project.invalid-scaffold",
+                input: "Keep this exact.",
+                options: CodexTaskThreadOptions(
+                    workingDirectory: projectDirectory,
+                    developerInstructions: "Aurora task wrapper"
+                )
+            )
+            throw VerificationFailure.failed(
+                "raw project creation accepted delegated-task developer instructions"
+            )
+        } catch CodexTaskRuntimeError.invalidInput {
+            // Expected.
+        }
+        await newRuntime.shutdown()
+
+        let existingThreadID = "thread-owner-existing"
+        let exactExistingText = "Please continue from here; keep the teal header."
+        let existingTransport = FakeCodexAppServerTransport()
+        await existingTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: existingThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+        ])
+        await existingTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-owner-complete",
+                "status": "completed",
+                "itemsView": "notLoaded",
+                "items": [],
+            ]]),
+        ])
+        // A real owner-selected chat reached 281 MB. If this path regresses to
+        // thread/read(includeTurns: true), the fake returns a response larger
+        // than the verifier's 128 KiB inbound boundary and the send fails.
+        await existingTransport.simulateOversizedHistoryOnIncludeTurns()
+        let existingRuntime = makeRuntime(transport: existingTransport)
+        let existingHandle = try await existingRuntime.sendExactMessage(
+            taskID: "project.owner-existing",
+            threadID: existingThreadID,
+            input: exactExistingText,
+            expectedWorkingDirectory: projectDirectory
+        )
+        try expect(
+            existingHandle.threadID == existingThreadID
+                && existingHandle.turnID == "turn-1",
+            "terminal owner thread did not continue as one new turn"
+        )
+        let existingMessages = try decodeMessages(await existingTransport.messageData())
+        guard let resume = existingMessages.first(where: {
+            $0["method"] as? String == "thread/resume"
+        }),
+              let resumeParams = resume["params"] as? [String: Any],
+              let continuedTurn = existingMessages.last(where: {
+                  $0["method"] as? String == "turn/start"
+              }),
+              let continuedParams = continuedTurn["params"] as? [String: Any],
+              let continuedInput = continuedParams["input"] as? [[String: Any]] else {
+            throw VerificationFailure.failed("existing raw thread was not resumed and continued")
+        }
+        try expect(
+            Set(resumeParams.keys) == Set(["threadId", "excludeTurns"])
+                && resumeParams["threadId"] as? String == existingThreadID
+                && resumeParams["excludeTurns"] as? Bool == true
+                && continuedInput.first?["text"] as? String == exactExistingText
+                && continuedParams["effort"] == nil
+                && continuedParams["outputSchema"] == nil,
+            "existing Codex settings were overridden or relayed text was rewritten"
+        )
+        let existingMethods = existingMessages.compactMap { $0["method"] as? String }
+        guard let listIndex = existingMethods.firstIndex(of: "thread/list"),
+              let turnsIndex = existingMethods.firstIndex(of: "thread/turns/list"),
+              let resumeIndex = existingMethods.firstIndex(of: "thread/resume"),
+              let turnIndex = existingMethods.lastIndex(of: "turn/start") else {
+            throw VerificationFailure.failed("raw existing-thread validation sequence was incomplete")
+        }
+        guard let turnsRequest = existingMessages.first(where: {
+            $0["method"] as? String == "thread/turns/list"
+        }), let turnsParams = turnsRequest["params"] as? [String: Any] else {
+            throw VerificationFailure.failed("bounded latest-turn lookup was missing")
+        }
+        try expect(
+            listIndex < turnsIndex && turnsIndex < resumeIndex && resumeIndex < turnIndex
+                && turnsParams["threadId"] as? String == existingThreadID
+                && turnsParams["limit"] as? Int == 1
+                && turnsParams["sortDirection"] as? String == "desc"
+                && turnsParams["itemsView"] as? String == "notLoaded"
+                && !existingMethods.contains("thread/read"),
+            "owner-selected thread executed before unarchived/project validation"
+        )
+
+        let reusedEvents = EventCollector()
+        await existingRuntime.setEventHandler { event in
+            Task { await reusedEvents.append(event) }
+        }
+        await existingTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: existingThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+        ])
+        await existingTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": existingHandle.turnID,
+                "status": "completed",
+                "itemsView": "notLoaded",
+                "items": [],
+            ]]),
+        ])
+        await existingTransport.completeNextTurnBeforeReturningStartHandle()
+        let reusedHandle = try await existingRuntime.sendExactMessage(
+            taskID: "project.owner-existing",
+            threadID: existingThreadID,
+            input: "One tiny follow-up.",
+            expectedWorkingDirectory: projectDirectory
+        )
+        try await Task.sleep(for: .milliseconds(25))
+        let reusedEventsArrived = await reusedEvents.events().contains {
+            $0.method == "turn/completed"
+                && $0.taskID == "project.owner-existing"
+                && $0.turnID == reusedHandle.turnID
+        }
+        let reusedActiveTurn = await existingRuntime.activeTurnID(
+            forTaskID: "project.owner-existing"
+        )
+        try expect(
+            reusedHandle.turnID == "turn-2"
+                && reusedActiveTurn == nil
+                && reusedEventsArrived,
+            "a reused-chat completion that beat turn/start was dropped or left falsely running"
+        )
+        await existingRuntime.shutdown()
+
+        let activeTransport = FakeCodexAppServerTransport()
+        await activeTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: existingThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+        ])
+        await activeTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-already-running",
+                "status": "inProgress",
+                "itemsView": "notLoaded",
+                "items": [],
+            ]]),
+        ])
+        let activeRuntime = makeRuntime(transport: activeTransport)
+        let activeText = "Also make the logo a little smaller."
+        let steered = try await activeRuntime.sendRawProjectMessage(
+            taskID: "project.owner-active",
+            threadID: existingThreadID,
+            input: activeText,
+            expectedWorkingDirectory: projectDirectory
+        )
+        try expect(
+            steered.turnID == "turn-already-running",
+            "active owner thread did not retain its exact turn identity"
+        )
+        let activeMessages = try decodeMessages(await activeTransport.messageData())
+        guard let activeSteer = activeMessages.first(where: {
+            $0["method"] as? String == "turn/steer"
+        }),
+              let activeParams = activeSteer["params"] as? [String: Any],
+              let activeInput = activeParams["input"] as? [[String: Any]] else {
+            throw VerificationFailure.failed("active owner thread was not steered")
+        }
+        try expect(
+            activeParams["expectedTurnId"] as? String == "turn-already-running"
+                && activeInput.first?["text"] as? String == activeText
+                && activeMessages.filter {
+                    $0["method"] as? String == "turn/start"
+                }.isEmpty,
+            "active thread was forked or the owner's steering text changed"
+        )
+        await activeRuntime.shutdown()
+
+        let raceTransport = FakeCodexAppServerTransport()
+        await raceTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: existingThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: existingThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+        ])
+        await raceTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-before-race",
+                "status": "completed",
+                "itemsView": "notLoaded",
+                "items": [],
+            ]]),
+            threadTurnsListFixture([[
+                "id": "turn-won-race",
+                "status": "inProgress",
+                "itemsView": "notLoaded",
+                "items": [],
+            ]]),
+        ])
+        await raceTransport.failNextTurnStart(message: "A turn is already active")
+        let raceRuntime = makeRuntime(transport: raceTransport)
+        let raceText = "Use the second layout after all."
+        let raceHandle = try await raceRuntime.sendRawProjectMessage(
+            taskID: "project.owner-race",
+            threadID: existingThreadID,
+            input: raceText,
+            expectedWorkingDirectory: projectDirectory
+        )
+        try expect(
+            raceHandle.turnID == "turn-won-race",
+            "changed turn state was not reconciled by the single bounded retry"
+        )
+        let raceMessages = try decodeMessages(await raceTransport.messageData())
+        let racedStarts = raceMessages.filter { $0["method"] as? String == "turn/start" }
+        let racedSteers = raceMessages.filter { $0["method"] as? String == "turn/steer" }
+        let racedStartParams = racedStarts.first?["params"] as? [String: Any]
+        let racedSteerParams = racedSteers.first?["params"] as? [String: Any]
+        try expect(
+            racedStarts.count == 1 && racedSteers.count == 1
+                && racedSteerParams?["expectedTurnId"] as? String == "turn-won-race"
+                && racedStartParams?["clientUserMessageId"] as? String
+                    == racedSteerParams?["clientUserMessageId"] as? String,
+            "changed-state recovery replayed more than once or targeted a stale turn"
+        )
+        await raceRuntime.shutdown()
+
+        let archivedTransport = FakeCodexAppServerTransport()
+        await archivedTransport.setThreadListResponses([threadListFixture([])])
+        let archivedRuntime = makeRuntime(transport: archivedTransport)
+        do {
+            _ = try await archivedRuntime.sendRawProjectMessage(
+                taskID: "project.archived",
+                threadID: "thread-archived",
+                input: "Continue this.",
+                expectedWorkingDirectory: projectDirectory
+            )
+            throw VerificationFailure.failed("archived thread was accepted as a live project target")
+        } catch CodexTaskRuntimeError.projectMessagePreparationFailed(
+            underlying: .threadUnavailable
+        ) {
+            // Expected.
+        }
+        let archivedMethods = try decodeMessages(
+            await archivedTransport.messageData()
+        ).compactMap { $0["method"] as? String }
+        try expect(
+            !archivedMethods.contains("thread/read")
+                && !archivedMethods.contains("thread/turns/list")
+                && !archivedMethods.contains("thread/resume")
+                && !archivedMethods.contains("turn/start")
+                && !archivedMethods.contains("turn/steer"),
+            "archived-thread rejection reached an execution RPC"
+        )
+        await archivedRuntime.shutdown()
+
+        let movedTransport = FakeCodexAppServerTransport()
+        await movedTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: "thread-moved",
+                    cwd: "/verification/Another Project",
+                    turns: []
+                ),
+            ]),
+        ])
+        let movedRuntime = makeRuntime(transport: movedTransport)
+        do {
+            _ = try await movedRuntime.sendRawProjectMessage(
+                taskID: "project.moved",
+                threadID: "thread-moved",
+                input: "Continue this.",
+                expectedWorkingDirectory: projectDirectory
+            )
+            throw VerificationFailure.failed("moved thread escaped its selected project boundary")
+        } catch CodexTaskRuntimeError.projectMessagePreparationFailed(
+            underlying: .threadWorkingDirectoryChanged
+        ) {
+            // Expected.
+        }
+        await movedRuntime.shutdown()
+
+        let omittedViewTransport = FakeCodexAppServerTransport()
+        await omittedViewTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: "thread-omitted-items-view",
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+        ])
+        await omittedViewTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-defaults-to-full",
+                "status": "completed",
+                "items": [],
+            ]]),
+        ])
+        let omittedViewRuntime = makeRuntime(transport: omittedViewTransport)
+        do {
+            _ = try await omittedViewRuntime.sendRawProjectMessage(
+                taskID: "project.omitted-items-view",
+                threadID: "thread-omitted-items-view",
+                input: "Continue this.",
+                expectedWorkingDirectory: projectDirectory
+            )
+            throw VerificationFailure.failed(
+                "a turn with an implicit full item view entered the bounded project path"
+            )
+        } catch CodexTaskRuntimeError.projectMessagePreparationFailed(
+            underlying: .protocolViolation
+        ) {
+            // Expected: Turn.itemsView defaults to full when omitted.
+        }
+        let omittedViewMethods = try decodeMessages(
+            await omittedViewTransport.messageData()
+        ).compactMap { $0["method"] as? String }
+        try expect(
+            !omittedViewMethods.contains("thread/resume")
+                && !omittedViewMethods.contains("turn/start")
+                && !omittedViewMethods.contains("turn/steer"),
+            "an unproven bounded turn response reached message submission"
+        )
+        await omittedViewRuntime.shutdown()
+    }
+
+    private static func verifyExactProjectThreadReconciliation() async throws {
+        let projectDirectory = URL(
+            fileURLWithPath: "/verification/Aurora V4",
+            isDirectory: true
+        )
+
+        let terminalThreadID = "thread-project-terminal"
+        let terminalTransport = FakeCodexAppServerTransport()
+        await terminalTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: terminalThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+        ])
+        await terminalTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-project-complete",
+                "status": "completed",
+                "itemsView": "summary",
+                "items": [[
+                    "id": "item-project-final",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "The course plan is finished. Next, choose the day-two lab.",
+                ]],
+            ]]),
+        ])
+        await terminalTransport.simulateOversizedHistoryOnIncludeTurns()
+        let terminalRuntime = makeRuntime(transport: terminalTransport)
+        let terminal = try await terminalRuntime.reconcileExactProjectThread(
+            taskID: "project.inspect-terminal",
+            threadID: terminalThreadID,
+            expectedTurnID: "turn-project-complete",
+            expectedWorkingDirectory: projectDirectory
+        )
+        try expect(
+            terminal.threadID == terminalThreadID
+                && terminal.latestTurnID == "turn-project-complete"
+                && terminal.status == .completed
+                && terminal.resultSummary
+                    == "The course plan is finished. Next, choose the day-two lab."
+                && terminal.threadName == "Selected owner task"
+                && terminal.workspacePath == projectDirectory.path,
+            "read-only project reconciliation lost the terminal Codex result"
+        )
+        let terminalMessages = try decodeMessages(
+            await terminalTransport.messageData()
+        )
+        let terminalMethods = terminalMessages.compactMap { $0["method"] as? String }
+        let terminalTurnsParams = terminalMessages.first(where: {
+            $0["method"] as? String == "thread/turns/list"
+        })?["params"] as? [String: Any]
+        try expect(
+            terminalMethods.filter { $0 == "thread/list" }.count == 1
+                && terminalMethods.filter { $0 == "thread/turns/list" }.count == 1
+                && terminalTurnsParams?["threadId"] as? String == terminalThreadID
+                && terminalTurnsParams?["limit"] as? Int == 1
+                && terminalTurnsParams?["sortDirection"] as? String == "desc"
+                && terminalTurnsParams?["itemsView"] as? String == "summary"
+                && !terminalMethods.contains("thread/read")
+                && !terminalMethods.contains("thread/resume")
+                && !terminalMethods.contains("thread/start")
+                && !terminalMethods.contains("turn/start")
+                && !terminalMethods.contains("turn/steer"),
+            "terminal project inspection mutated or resumed the selected thread"
+        )
+        let terminalMappedThread = await terminalRuntime.threadID(
+            forTaskID: "project.inspect-terminal"
+        )
+        let terminalActiveTurn = await terminalRuntime.activeTurnID(
+            forTaskID: "project.inspect-terminal"
+        )
+        try expect(
+            terminalMappedThread == terminalThreadID && terminalActiveTurn == nil,
+            "terminal project inspection did not preserve its exact task mapping"
+        )
+        await terminalRuntime.shutdown()
+
+        let racingThreadID = "thread-project-racing"
+        let racingTransport = FakeCodexAppServerTransport()
+        await racingTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: racingThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: racingThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+        ])
+        await racingTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-project-racing",
+                "status": "inProgress",
+                "itemsView": "summary",
+                "items": [],
+            ]]),
+            threadTurnsListFixture([[
+                "id": "turn-project-racing",
+                "status": "completed",
+                "itemsView": "summary",
+                "items": [[
+                    "id": "item-project-racing-final",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "I finished the site and left one design question for you.",
+                ]],
+            ]]),
+        ])
+        let racingRuntime = makeRuntime(transport: racingTransport)
+        let raced = try await racingRuntime.reconcileExactProjectThread(
+            taskID: "project.inspect-racing",
+            threadID: racingThreadID,
+            expectedTurnID: "turn-project-racing",
+            expectedWorkingDirectory: projectDirectory
+        )
+        try expect(
+            raced.status == .completed
+                && raced.latestTurnID == "turn-project-racing"
+                && raced.resultSummary
+                    == "I finished the site and left one design question for you.",
+            "read→subscribe reconciliation missed a just-completed project turn"
+        )
+        let racingMessages = try decodeMessages(await racingTransport.messageData())
+        guard let resume = racingMessages.first(where: {
+            $0["method"] as? String == "thread/resume"
+        }), let resumeParams = resume["params"] as? [String: Any] else {
+            throw VerificationFailure.failed(
+                "running project inspection did not subscribe to its existing thread"
+            )
+        }
+        let racingMethods = racingMessages.compactMap { $0["method"] as? String }
+        try expect(
+            Set(resumeParams.keys) == Set(["threadId", "excludeTurns"])
+                && resumeParams["threadId"] as? String == racingThreadID
+                && resumeParams["excludeTurns"] as? Bool == true,
+            "project inspection overrode settings while subscribing"
+        )
+        try expect(
+            racingMethods.filter { $0 == "thread/list" }.count == 2
+                && racingMethods.filter { $0 == "thread/turns/list" }.count == 2
+                && racingMethods.filter { $0 == "thread/resume" }.count == 1
+                && !racingMethods.contains("thread/read")
+                && !racingMethods.contains("thread/start")
+                && !racingMethods.contains("turn/start")
+                && !racingMethods.contains("turn/steer"),
+            "project reconciliation started or modified a model turn"
+        )
+        let racingMappedThread = await racingRuntime.threadID(
+            forTaskID: "project.inspect-racing"
+        )
+        let racingActiveTurn = await racingRuntime.activeTurnID(
+            forTaskID: "project.inspect-racing"
+        )
+        try expect(
+            racingMappedThread == racingThreadID && racingActiveTurn == nil,
+            "completed race reconciliation left a stale active turn"
+        )
+        await racingRuntime.shutdown()
+
+        let runningThreadID = "thread-project-running"
+        let runningTurn: [String: Any] = [
+            "id": "turn-project-running",
+            "status": "inProgress",
+            "itemsView": "summary",
+            "items": [],
+        ]
+        let runningTransport = FakeCodexAppServerTransport()
+        await runningTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: runningThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: runningThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+        ])
+        await runningTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([runningTurn]),
+            threadTurnsListFixture([runningTurn]),
+        ])
+        let runningRuntime = makeRuntime(transport: runningTransport)
+        let running = try await runningRuntime.reconcileExactProjectThread(
+            taskID: "project.inspect-running",
+            threadID: runningThreadID,
+            expectedTurnID: "turn-project-running",
+            expectedWorkingDirectory: projectDirectory
+        )
+        let reconciledActiveTurn = await runningRuntime.activeTurnID(
+            forTaskID: "project.inspect-running"
+        )
+        try expect(
+            running.status == .running
+                && running.latestTurnID == "turn-project-running"
+                && reconciledActiveTurn == "turn-project-running",
+            "live project reconciliation did not retain its active turn"
+        )
+        let runningMethods = try decodeMessages(
+            await runningTransport.messageData()
+        ).compactMap { $0["method"] as? String }
+        try expect(
+            runningMethods.filter { $0 == "thread/list" }.count == 2
+                && runningMethods.filter { $0 == "thread/turns/list" }.count == 2
+                && runningMethods.filter { $0 == "thread/resume" }.count == 1
+                && !runningMethods.contains("thread/read")
+                && !runningMethods.contains("turn/start")
+                && !runningMethods.contains("turn/steer"),
+            "live project inspection emitted an action RPC"
+        )
+        await runningRuntime.shutdown()
+
+        let changedThreadID = "thread-project-changed-turn"
+        let changedTransport = FakeCodexAppServerTransport()
+        await changedTransport.setThreadListResponses([threadListFixture([
+            desktopThreadFixture(
+                threadID: changedThreadID,
+                cwd: projectDirectory.path,
+                turns: []
+            ),
+        ])])
+        await changedTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-unrelated-latest",
+                "status": "inProgress",
+                "itemsView": "summary",
+                "items": [],
+            ]]),
+        ])
+        let changedRuntime = makeRuntime(transport: changedTransport)
+        do {
+            _ = try await changedRuntime.reconcileExactProjectThread(
+                taskID: "project.inspect-changed-turn",
+                threadID: changedThreadID,
+                expectedTurnID: "turn-durably-bound",
+                expectedWorkingDirectory: projectDirectory
+            )
+            throw VerificationFailure.failed(
+                "an unrelated latest project turn was adopted during exact reconciliation"
+            )
+        } catch CodexTaskRuntimeError.expectedProjectTurnChanged {
+            // Expected: reject before resume, task binding, or event sync.
+        }
+        let changedMethods = try decodeMessages(
+            await changedTransport.messageData()
+        ).compactMap { $0["method"] as? String }
+        let changedMapping = await changedRuntime.threadID(
+            forTaskID: "project.inspect-changed-turn"
+        )
+        try expect(
+            changedMapping == nil
+                && !changedMethods.contains("thread/resume")
+                && changedMethods.filter { $0 == "thread/turns/list" }.count == 1,
+            "turn mismatch was detected only after the unrelated thread was bound"
+        )
+        await changedRuntime.shutdown()
+
+        let archivedTransport = FakeCodexAppServerTransport()
+        await archivedTransport.setThreadListResponses([threadListFixture([])])
+        let archivedRuntime = makeRuntime(transport: archivedTransport)
+        do {
+            _ = try await archivedRuntime.reconcileExactProjectThread(
+                taskID: "project.inspect-archived",
+                threadID: "thread-project-archived",
+                expectedWorkingDirectory: projectDirectory
+            )
+            throw VerificationFailure.failed(
+                "archived project thread was accepted for reconciliation"
+            )
+        } catch CodexTaskRuntimeError.threadUnavailable {
+            // Expected.
+        }
+        let archivedMethods = try decodeMessages(
+            await archivedTransport.messageData()
+        ).compactMap { $0["method"] as? String }
+        try expect(
+            !archivedMethods.contains("thread/read")
+                && !archivedMethods.contains("thread/turns/list")
+                && !archivedMethods.contains("thread/resume")
+                && !archivedMethods.contains("turn/start")
+                && !archivedMethods.contains("turn/steer"),
+            "archived project inspection crossed its validation boundary"
+        )
+        await archivedRuntime.shutdown()
+
+        let movedTransport = FakeCodexAppServerTransport()
+        await movedTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: "thread-project-moved",
+                    cwd: "/verification/Another Project",
+                    turns: []
+                ),
+            ]),
+        ])
+        let movedRuntime = makeRuntime(transport: movedTransport)
+        do {
+            _ = try await movedRuntime.reconcileExactProjectThread(
+                taskID: "project.inspect-moved",
+                threadID: "thread-project-moved",
+                expectedWorkingDirectory: projectDirectory
+            )
+            throw VerificationFailure.failed(
+                "moved project thread was accepted for reconciliation"
+            )
+        } catch CodexTaskRuntimeError.threadWorkingDirectoryChanged {
+            // Expected.
+        }
+        let movedMethods = try decodeMessages(
+            await movedTransport.messageData()
+        ).compactMap { $0["method"] as? String }
+        try expect(
+            !movedMethods.contains("thread/read")
+                && !movedMethods.contains("thread/resume")
+                && !movedMethods.contains("turn/start")
+                && !movedMethods.contains("turn/steer"),
+            "moved project inspection crossed its project boundary"
+        )
+        await movedRuntime.shutdown()
     }
 
     private static func verifyRestartResumesMappedThread() async throws {
@@ -1461,6 +2405,7 @@ private enum CodexTaskRuntimeVerifier {
         _ = try await runtime.startTask(taskID: "shared-task", input: "Begin")
         let sharedLaunches = await shared.launchData()
         let standaloneCounts = await standalone.counts()
+        try await waitUntil { await registrar.registrations().count == 1 }
         let sharedRegistrations = await registrar.registrations()
         try expect(
             sharedLaunches.count == 1
@@ -1473,8 +2418,8 @@ private enum CodexTaskRuntimeVerifier {
             "a compatible daemon did not select the managed WebSocket proxy transport"
         )
         try expect(
-            sharedRegistrations.isEmpty,
-            "shared-daemon threads still triggered the legacy one-time Desktop deeplink"
+            sharedRegistrations == ["thread-1"],
+            "shared-daemon task was not nudged into the Desktop thread list exactly once"
         )
 
         // The coordinator may preflight while shared is healthy, then race a
@@ -1534,6 +2479,7 @@ private enum CodexTaskRuntimeVerifier {
         _ = try await fallbackRuntime.startTask(taskID: "fallback-task", input: "Begin")
         let failedSharedCounts = await unavailableShared.counts()
         let fallbackLaunches = await fallbackStandalone.launchData()
+        try await waitUntil { await fallbackRegistrar.registrations().count == 1 }
         let fallbackRegistrations = await fallbackRegistrar.registrations()
         try expect(
             failedSharedCounts.starts == 1
@@ -1775,6 +2721,19 @@ private enum CodexTaskRuntimeVerifier {
         }
         try await runtime.start()
         let firstAccount = await runtime.accountSnapshot
+        let liveThreads = try await runtime.listThreads(query: AuroraCodexThreadQuery(
+            limit: 1
+        ))
+        if let firstThread = liveThreads.threads.first {
+            let liveDocument = try await runtime.readThread(
+                threadID: firstThread.threadID,
+                includeTurns: false
+            )
+            try expect(
+                liveDocument.summary.threadID == firstThread.threadID,
+                "live typed thread/read changed the listed Codex identity"
+            )
+        }
         try await runtime.restart()
         let restartedAccount = await runtime.accountSnapshot
         await runtime.shutdown()
@@ -1842,6 +2801,52 @@ private enum CodexTaskRuntimeVerifier {
             desktopThreadRegistrar: desktopThreadRegistrar,
             sharedDaemonProbe: VerificationSharedDaemonProbe(result: .unavailable)
         )
+    }
+
+    private static func desktopThreadFixture(
+        threadID: String,
+        cwd: String,
+        status: String = "notLoaded",
+        ephemeral: Bool = false,
+        turns: [[String: Any]]
+    ) -> [String: Any] {
+        [
+            "id": threadID,
+            "sessionId": "session-fixture",
+            "name": "Selected owner task",
+            "preview": "Selected owner task",
+            "cwd": cwd,
+            "status": ["type": status],
+            "source": "vscode",
+            "threadSource": "user",
+            "modelProvider": "openai",
+            "cliVersion": "0.145.0",
+            "createdAt": 1_700_000_000,
+            "updatedAt": 1_700_000_001,
+            "ephemeral": ephemeral,
+            "turns": turns,
+        ]
+    }
+
+    private static func threadListFixture(
+        _ threads: [[String: Any]],
+        nextCursor: String? = nil
+    ) -> [String: Any] {
+        [
+            "data": threads,
+            "nextCursor": nextCursor ?? NSNull(),
+        ]
+    }
+
+    private static func threadTurnsListFixture(
+        _ turns: [[String: Any]],
+        nextCursor: String? = nil
+    ) -> [String: Any] {
+        [
+            "data": turns,
+            "nextCursor": nextCursor ?? NSNull(),
+            "backwardsCursor": NSNull(),
+        ]
     }
 
     private static func decodeMessages(_ messages: [Data]) throws -> [[String: Any]] {

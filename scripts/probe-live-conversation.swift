@@ -4,6 +4,7 @@ private enum LiveConversationProbeError: LocalizedError {
     case missingKey
     case malformedMessage
     case invalidConversationMove(String)
+    case invalidDelegateTask(String)
     case timedOut
     case server(String)
 
@@ -15,6 +16,8 @@ private enum LiveConversationProbeError: LocalizedError {
             return "The Realtime service returned an unreadable event."
         case .invalidConversationMove(let field):
             return "The Realtime service returned an invalid conversation_move (\(field))."
+        case .invalidDelegateTask(let field):
+            return "The Realtime service returned an invalid delegate_task (\(field))."
         case .timedOut:
             return "The Realtime conversation probe timed out."
         case .server(let message):
@@ -34,6 +37,25 @@ private struct ProbeTurn: Codable {
     let timeToFirstAudioMilliseconds: Int
     let speechLatencyMilliseconds: Int
     let totalLatencyMilliseconds: Int
+}
+
+private struct ProbeDelegateTask: Codable {
+    let commitment: String
+    let operation: String
+    let targetReference: String
+    let taskKind: String
+    let executionClass: String
+    let preservesRequestedPage: Bool
+    let preservesNoOpenConstraint: Bool
+}
+
+private struct ProbeCodexProjectChat: Codable {
+    let commitment: String
+    let operation: String
+    let projectName: String
+    let chatNameWasNull: Bool
+    let threadIDWasNull: Bool
+    let messageWasNull: Bool
 }
 
 /// The probe intentionally validates only the private decision it needs to
@@ -114,6 +136,11 @@ private final class RealtimeProbe: @unchecked Sendable {
             "type": "object",
             "additionalProperties": false,
             "properties": [
+                "turn_domain": [
+                    "type": "string",
+                    "enum": ["social"],
+                    "description": "This probe exercises ordinary social turns only.",
+                ],
                 "perceived_turn": [
                     "type": "string",
                     "enum": [
@@ -229,7 +256,7 @@ private final class RealtimeProbe: @unchecked Sendable {
                 ],
             ],
             "required": [
-                "perceived_turn", "interaction_kind", "proposed_move", "answer_degree",
+                "turn_domain", "perceived_turn", "interaction_kind", "proposed_move", "answer_degree",
                 "aurora_first_person_position", "private_rationale", "record_ids",
                 "record_updates", "understanding_updates",
             ],
@@ -399,6 +426,232 @@ private final class RealtimeProbe: @unchecked Sendable {
         throw LiveConversationProbeError.timedOut
     }
 
+    /// Exercises the installed production delegate_task schema against the
+    /// actual Realtime model. It validates the returned arguments with the
+    /// same strict host type used by Aurora and performs no external action.
+    func delegateTask(_ text: String) async throws -> ProbeDelegateTask {
+        let schemaData = try JSONEncoder().encode(
+            DelegateTaskProposal.realtimeFunctionSchema
+        )
+        guard let schema = try JSONSerialization.jsonObject(with: schemaData)
+                as? [String: Any] else {
+            throw LiveConversationProbeError.invalidDelegateTask("schema")
+        }
+        try await send([
+            "type": "conversation.item.create",
+            "item": [
+                "type": "message",
+                "role": "user",
+                "content": [["type": "input_text", "text": text]],
+            ],
+        ])
+        try await send([
+            "type": "response.create",
+            "response": [
+                "output_modalities": ["audio"],
+                "max_output_tokens": 512,
+                "tools": [schema],
+                "tool_choice": "required",
+                "instructions": "Resolve this finalized owner task privately. Call delegate_task exactly once using its complete schema. Emit no audio before the call.",
+            ],
+        ])
+
+        let deadline = Date().addingTimeInterval(45)
+        var emittedPreToolAudio = false
+        while Date() < deadline {
+            let event = try await receiveEvent()
+            let type = event["type"] as? String ?? ""
+            switch type {
+            case "response.output_audio.delta", "response.audio.delta",
+                 "response.output_audio_transcript.delta", "response.audio_transcript.delta":
+                if let delta = event["delta"] as? String, !delta.isEmpty {
+                    emittedPreToolAudio = true
+                }
+            case "response.done":
+                guard !emittedPreToolAudio,
+                      let response = event["response"] as? [String: Any],
+                      response["status"] as? String == "completed",
+                      let output = response["output"] as? [[String: Any]] else {
+                    throw LiveConversationProbeError.invalidDelegateTask(
+                        "response status"
+                    )
+                }
+                let calls = output.filter {
+                    $0["type"] as? String == "function_call"
+                        && $0["status"] as? String == "completed"
+                }
+                guard output.count == 1,
+                      calls.count == 1,
+                      calls[0]["name"] as? String == "delegate_task",
+                      let argumentText = calls[0]["arguments"] as? String,
+                      argumentText.utf8.count <= 32_768,
+                      let argumentData = argumentText.data(using: .utf8),
+                      let arguments = try? JSONDecoder().decode(
+                        [String: ToolJSONValue].self,
+                        from: argumentData
+                      ) else {
+                    throw LiveConversationProbeError.invalidDelegateTask(
+                        "function call"
+                    )
+                }
+                let proposal: DelegateTaskProposal
+                do {
+                    proposal = try DelegateTaskProposal(arguments: arguments)
+                } catch let error as DelegateTaskProposalValidationError {
+                    throw LiveConversationProbeError.invalidDelegateTask(
+                        "\(error.diagnosticCode) at \(error.diagnosticPath)"
+                    )
+                }
+                let combinedEffect = [
+                    proposal.parameters.goal,
+                    proposal.parameters.successCriteria,
+                    proposal.parameters.instruction,
+                ]
+                    .compactMap { $0 }
+                    .joined(separator: " ")
+                    .lowercased()
+                let preservesRequestedPage =
+                    combinedEffect.contains("html")
+                    && combinedEffect.contains("black")
+                    && combinedEffect.contains("teal")
+                    && combinedEffect.contains("voice was the interface all along")
+                let preservesNoOpenConstraint =
+                    combinedEffect.contains("do not open")
+                    || combinedEffect.contains("don't open")
+                    || combinedEffect.contains("without opening")
+                    || combinedEffect.contains("not open")
+                guard proposal.commitment == .execute,
+                      proposal.operation == .start,
+                      proposal.targetReference == .newTask,
+                      proposal.taskKind == .coding,
+                      proposal.executionClass == .project,
+                      preservesRequestedPage,
+                      preservesNoOpenConstraint else {
+                    let diagnosedKind = proposal.taskKind?.rawValue ?? "null"
+                    let diagnosedClass = proposal.executionClass?.rawValue ?? "null"
+                    throw LiveConversationProbeError.invalidDelegateTask(
+                        "resolved effect: commitment=\(proposal.commitment.rawValue), operation=\(proposal.operation.rawValue), target=\(proposal.targetReference.rawValue), kind=\(diagnosedKind), class=\(diagnosedClass), page=\(preservesRequestedPage), no_open=\(preservesNoOpenConstraint)"
+                    )
+                }
+                return ProbeDelegateTask(
+                    commitment: proposal.commitment.rawValue,
+                    operation: proposal.operation.rawValue,
+                    targetReference: proposal.targetReference.rawValue,
+                    taskKind: proposal.taskKind?.rawValue ?? "",
+                    executionClass: proposal.executionClass?.rawValue ?? "",
+                    preservesRequestedPage: preservesRequestedPage,
+                    preservesNoOpenConstraint: preservesNoOpenConstraint
+                )
+            case "error":
+                throw LiveConversationProbeError.server(Self.serverMessage(event))
+            default:
+                continue
+            }
+        }
+        throw LiveConversationProbeError.timedOut
+    }
+
+    /// Confirms the live Realtime model selects the project/chat route from
+    /// the same three semantic choices production exposes. No Codex task is
+    /// opened and no local focus or external state is changed by this probe.
+    func codexProjectChat(_ text: String) async throws -> ProbeCodexProjectChat {
+        let schemaData = try JSONEncoder().encode(
+            CodexProjectChatProposal.realtimeFunctionSchema
+        )
+        guard let schema = try JSONSerialization.jsonObject(with: schemaData)
+                as? [String: Any] else {
+            throw LiveConversationProbeError.invalidDelegateTask("project schema")
+        }
+        let delegateData = try JSONEncoder().encode(
+            DelegateTaskProposal.realtimeFunctionSchema
+        )
+        var conversationSchema = Self.conversationMoveTool
+        guard let delegateSchema = try JSONSerialization.jsonObject(
+            with: delegateData
+        ) as? [String: Any],
+        var parameters = conversationSchema["parameters"] as? [String: Any],
+        var properties = parameters["properties"] as? [String: Any],
+        var turnDomain = properties["turn_domain"] as? [String: Any] else {
+            throw LiveConversationProbeError.invalidDelegateTask("semantic schemas")
+        }
+        turnDomain["enum"] = ["social", "delegated_action", "codex_project_chat"]
+        turnDomain["description"] = "Truthful semantic domain of the finalized owner turn. Named Codex project or chat navigation, selection, status, continuation, and relay are codex_project_chat."
+        properties["turn_domain"] = turnDomain
+        parameters["properties"] = properties
+        conversationSchema["parameters"] = parameters
+        conversationSchema["description"] = "Ordinary social replies only. Truthfully classify turn_domain even when that makes this the wrong route. Named Codex project/chat work uses codex_project_chat; other external work uses delegate_task."
+        try await send([
+            "type": "conversation.item.create",
+            "item": [
+                "type": "message",
+                "role": "user",
+                "content": [["type": "input_text", "text": text]],
+            ],
+        ])
+        try await send([
+            "type": "response.create",
+            "response": [
+                "output_modalities": ["audio"],
+                "max_output_tokens": 256,
+                "tools": [conversationSchema, schema, delegateSchema],
+                "tool_choice": "required",
+                "instructions": "Resolve the finalized owner turn exactly once with the correct semantic function and emit no audio. Use codex_project_chat for any request to work in, select, open, inspect, continue, or message a named Codex project/chat, even before a later work message is supplied. Use delegate_task only for other external work and conversation_move only for social conversation.",
+            ],
+        ])
+        let deadline = Date().addingTimeInterval(45)
+        var emittedAudio = false
+        while Date() < deadline {
+            let event = try await receiveEvent()
+            switch event["type"] as? String ?? "" {
+            case "response.output_audio.delta", "response.audio.delta",
+                 "response.output_audio_transcript.delta", "response.audio_transcript.delta":
+                if let delta = event["delta"] as? String, !delta.isEmpty { emittedAudio = true }
+            case "response.done":
+                guard !emittedAudio,
+                      let response = event["response"] as? [String: Any],
+                      response["status"] as? String == "completed",
+                      let output = response["output"] as? [[String: Any]],
+                      output.count == 1,
+                      output[0]["type"] as? String == "function_call",
+                      output[0]["name"] as? String == "codex_project_chat",
+                      let argumentText = output[0]["arguments"] as? String,
+                      let argumentData = argumentText.data(using: .utf8),
+                      let arguments = try? JSONDecoder().decode(
+                          [String: ToolJSONValue].self,
+                          from: argumentData
+                      ) else {
+                    throw LiveConversationProbeError.invalidDelegateTask("project function call")
+                }
+                let proposal: CodexProjectChatProposal
+                do {
+                    proposal = try CodexProjectChatProposal(arguments: arguments)
+                } catch let error as DelegateTaskProposalValidationError {
+                    throw LiveConversationProbeError.invalidDelegateTask(
+                        "project \(error.diagnosticCode) at \(error.diagnosticPath)"
+                    )
+                }
+                guard proposal.commitment == .execute,
+                      proposal.operation == .focusProject,
+                      let projectName = proposal.projectName else {
+                    throw LiveConversationProbeError.invalidDelegateTask("project intent")
+                }
+                return ProbeCodexProjectChat(
+                    commitment: proposal.commitment.rawValue,
+                    operation: proposal.operation.rawValue,
+                    projectName: projectName,
+                    chatNameWasNull: proposal.chatName == nil,
+                    threadIDWasNull: proposal.threadID == nil,
+                    messageWasNull: proposal.message == nil
+                )
+            case "error":
+                throw LiveConversationProbeError.server(Self.serverMessage(event))
+            default:
+                continue
+            }
+        }
+        throw LiveConversationProbeError.timedOut
+    }
+
     private static func privateDirection(
         for move: ValidatedConversationMove
     ) -> String {
@@ -494,7 +747,7 @@ private final class RealtimeProbe: @unchecked Sendable {
         }
 
         let requiredFields: Set<String> = [
-            "perceived_turn", "interaction_kind", "proposed_move", "answer_degree",
+            "turn_domain", "perceived_turn", "interaction_kind", "proposed_move", "answer_degree",
             "aurora_first_person_position", "private_rationale", "record_ids",
             "record_updates", "understanding_updates",
         ]
@@ -502,6 +755,11 @@ private final class RealtimeProbe: @unchecked Sendable {
         guard requiredFields.isSubset(of: Set(arguments.keys)),
               Set(arguments.keys).isSubset(of: allowedFields) else {
             throw LiveConversationProbeError.invalidConversationMove("top-level fields")
+        }
+        guard try boundedString(
+            "turn_domain", in: arguments, maximumCharacters: 48
+        ) == "social" else {
+            throw LiveConversationProbeError.invalidConversationMove("turn_domain")
         }
 
         let perceivedTurn = try boundedString(
@@ -828,6 +1086,50 @@ private enum AuroraLiveConversationProbe {
                 instructions: instructions,
                 reasoningEffort: reasoningEffort
             )
+
+            if ProcessInfo.processInfo.environment[
+                "AURORA_PROBE_PROJECT_CHAT"
+            ] == "1" {
+                let result = try await probe.codexProjectChat(
+                    "I want to work in the AI Engineering Journey project right now."
+                )
+                let payload: [String: Any] = [
+                    "ok": true,
+                    "model": "gpt-realtime-2.1",
+                    "externalEffects": 0,
+                    "codexProjectChat": try JSONSerialization.jsonObject(
+                        with: JSONEncoder().encode(result)
+                    ),
+                ]
+                let data = try JSONSerialization.data(
+                    withJSONObject: payload,
+                    options: [.prettyPrinted, .sortedKeys]
+                )
+                print(String(decoding: data, as: UTF8.self))
+                return
+            }
+
+            if ProcessInfo.processInfo.environment[
+                "AURORA_PROBE_DELEGATE_EXACT"
+            ] == "1" {
+                let result = try await probe.delegateTask(
+                    "While we're talking, make a single HTML page in a new folder on my desktop. Black background, one teal pulse, and the words voice was the interface all along. Don't open it yet."
+                )
+                let payload: [String: Any] = [
+                    "ok": true,
+                    "model": "gpt-realtime-2.1",
+                    "externalEffects": 0,
+                    "delegateTask": try JSONSerialization.jsonObject(
+                        with: JSONEncoder().encode(result)
+                    ),
+                ]
+                let data = try JSONSerialization.data(
+                    withJSONObject: payload,
+                    options: [.prettyPrinted, .sortedKeys]
+                )
+                print(String(decoding: data, as: UTF8.self))
+                return
+            }
 
             let fullPrompts = [
                 "Hey.",

@@ -257,3 +257,248 @@ public enum DelegateTaskAuthorizationFactory {
         return values.filter { seen.insert($0).inserted }
     }
 }
+
+/// Exact effect authorized for one explicit Codex project/chat operation.
+/// `relayText` is host-finalized transcript evidence for staged relay, or the
+/// tightly extracted message for the explicit one-shot relay operation.
+public struct CodexProjectChatResolvedTarget: Codable, Sendable, Equatable {
+    /// Monotonic host-owned generation of the selected project/chat state.
+    /// This makes an authorization stale if another call switches or leaves
+    /// focus before execution reaches the dispatch boundary.
+    public let focusGeneration: UInt64
+    public let mode: CodexProjectChatFocusMode?
+    public let projectDisplayName: String?
+    /// Registered/local project root used for Desktop grouping and new chats.
+    public let workspacePath: String?
+    /// Exact existing thread cwd used by app-server security validation. It
+    /// may be a descendant of the project root.
+    public let threadWorkingDirectoryPath: String?
+    public let threadDisplayName: String?
+    public let threadID: String?
+
+    public init(
+        focusGeneration: UInt64,
+        mode: CodexProjectChatFocusMode?,
+        projectDisplayName: String?,
+        workspacePath: String?,
+        threadWorkingDirectoryPath: String?,
+        threadDisplayName: String?,
+        threadID: String?
+    ) {
+        self.focusGeneration = focusGeneration
+        self.mode = mode
+        self.projectDisplayName = projectDisplayName
+        self.workspacePath = workspacePath
+        self.threadWorkingDirectoryPath = threadWorkingDirectoryPath
+        self.threadDisplayName = threadDisplayName
+        self.threadID = threadID
+    }
+}
+
+public struct CodexProjectChatEffect: Codable, Sendable, Equatable {
+    public let operation: CodexProjectChatOperation
+    public let projectName: String?
+    public let chatName: String?
+    public let threadID: String?
+    public let relayText: String?
+    public let resolvedTarget: CodexProjectChatResolvedTarget
+
+    public init(
+        proposal: CodexProjectChatProposal,
+        relayText: String?,
+        resolvedTarget: CodexProjectChatResolvedTarget
+    ) {
+        operation = proposal.operation
+        projectName = proposal.projectName
+        chatName = proposal.chatName
+        threadID = proposal.threadID
+        self.relayText = relayText
+        self.resolvedTarget = resolvedTarget
+    }
+}
+
+public struct CodexProjectChatAuthorizationEnvelope: Codable, Sendable, Equatable {
+    public let authorizationID: String
+    public let requestID: String
+    public let sourceTurnID: String
+    public let sessionID: String
+    public let speakerBinding: AuthorizationSpeakerBinding
+    public let allowedEffect: CodexProjectChatEffect
+    public let confirmationState: AuthorizationConfirmationState
+    public let issuedAt: Date
+    public let expiresAt: Date
+
+    public func allows(
+        _ effect: CodexProjectChatEffect,
+        at date: Date = Date()
+    ) -> Bool {
+        confirmationState.permitsExecution
+            && date >= issuedAt
+            && date <= expiresAt
+            && effect == allowedEffect
+    }
+
+    public var isActiveForProjectChat: Bool {
+        confirmationState.permitsExecution
+            && Date() >= issuedAt
+            && Date() <= expiresAt
+    }
+}
+
+public enum CodexProjectChatAuthorizationFactory {
+    public static let lifetime: TimeInterval = 20
+
+    public static func issue(
+        proposal: CodexProjectChatProposal,
+        relayText: String?,
+        resolvedTarget: CodexProjectChatResolvedTarget,
+        sourceTranscript: String?,
+        context: ToolInvocationContext,
+        confirmationState: AuthorizationConfirmationState = .notRequired,
+        now: Date = Date(),
+        authorizationID: String = UUID().uuidString
+    ) -> Result<CodexProjectChatAuthorizationEnvelope, DelegateTaskAuthorizationDenialReason> {
+        guard validIdentity(context.callID), validIdentity(authorizationID) else {
+            return .failure(.requestUnavailable)
+        }
+        guard let sessionID = context.sessionID, validIdentity(sessionID) else {
+            return .failure(.sessionUnavailable)
+        }
+        guard context.participantIsOwner else { return .failure(.speakerUnverified) }
+        guard context.sourceTurnFinalized else { return .failure(.turnUnfinalized) }
+        guard context.authorizationSource == .directOwnerTurn else {
+            return .failure(.indirectContinuation)
+        }
+        guard context.origin == DelegateTaskAuthorizationFactory.trustedVoiceOrigin,
+              context.hasTrustedCurrentOwnerAudio else {
+            return .failure(.untrustedOrigin)
+        }
+        guard let sourceTurnID = context.ownerAudioItemID,
+              validIdentity(sourceTurnID) else {
+            return .failure(.sourceTurnUnavailable)
+        }
+        switch proposal.commitment {
+        case .execute: break
+        case .cancel: return .failure(.intentCancelled)
+        case .conditional: return .failure(.intentConditional)
+        case .delayed: return .failure(.intentDelayed)
+        case .uncertain: return .failure(.intentUncertain)
+        }
+        switch confirmationState {
+        case .notRequired, .confirmed: break
+        case .pending: return .failure(.confirmationRequired)
+        case .denied: return .failure(.confirmationDenied)
+        }
+        let effect = CodexProjectChatEffect(
+            proposal: proposal,
+            relayText: relayText,
+            resolvedTarget: resolvedTarget
+        )
+        switch proposal.operation {
+        case .relay, .relayToChat:
+            guard let relayText,
+                  relayText == relayText.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !relayText.isEmpty,
+                  relayText.count <= CodexProjectChatProposal.maximumMessageCharacters,
+                  relayText.unicodeScalars.allSatisfy({
+                      !CharacterSet.controlCharacters
+                          .subtracting(.newlines)
+                          .contains($0)
+                  }) else {
+                return .failure(.effectMismatch)
+            }
+            if proposal.operation == .relayToChat {
+                guard sourceTranscript?.contains(relayText) == true else {
+                    // The one-shot message must be an exact owner-audio span.
+                    // Realtime may locate it, but may never paraphrase or add
+                    // instructions at this authorization boundary.
+                    return .failure(.effectMismatch)
+                }
+            }
+        default:
+            guard relayText == nil else { return .failure(.effectMismatch) }
+        }
+        guard validResolvedTarget(resolvedTarget, for: proposal.operation) else {
+            return .failure(.effectMismatch)
+        }
+        let expiresAt = now.addingTimeInterval(lifetime)
+        guard expiresAt > now else { return .failure(.invalidExpiration) }
+        return .success(CodexProjectChatAuthorizationEnvelope(
+            authorizationID: authorizationID,
+            requestID: context.callID,
+            sourceTurnID: sourceTurnID,
+            sessionID: sessionID,
+            speakerBinding: .configuredOwnerVoiceSession,
+            allowedEffect: effect,
+            confirmationState: confirmationState,
+            issuedAt: now,
+            expiresAt: expiresAt
+        ))
+    }
+
+    private static func validIdentity(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value == trimmed
+            && !trimmed.isEmpty
+            && trimmed.count <= 256
+            && trimmed.unicodeScalars.allSatisfy({
+                !CharacterSet.controlCharacters.contains($0)
+            })
+    }
+
+    private static func validResolvedTarget(
+        _ target: CodexProjectChatResolvedTarget,
+        for operation: CodexProjectChatOperation
+    ) -> Bool {
+        let workspaceValid = target.workspacePath.map {
+            !$0.isEmpty && $0.hasPrefix("/") && $0.count <= 4_096
+        } ?? true
+        let threadValid = target.threadID.map(validIdentity) ?? true
+        let threadWorkspaceValid = target.threadWorkingDirectoryPath.map {
+            !$0.isEmpty && $0.hasPrefix("/") && $0.count <= 4_096
+        } ?? true
+        guard workspaceValid, threadWorkspaceValid, threadValid else { return false }
+        switch operation {
+        case .listProjects:
+            return target.mode == nil
+                && target.workspacePath == nil
+                && target.threadWorkingDirectoryPath == nil
+                && target.threadID == nil
+        case .focusProject:
+            return target.mode == .projectSelected
+                && target.workspacePath != nil
+                && target.threadWorkingDirectoryPath == nil
+                && target.threadID == nil
+        case .focusChat, .relayToChat:
+            return target.mode == .threadSelected
+                && target.workspacePath != nil
+                && target.threadWorkingDirectoryPath != nil
+                && target.threadID != nil
+        case .prepareNewChat:
+            return target.mode == .newThreadPending
+                && target.workspacePath != nil
+                && target.threadWorkingDirectoryPath == nil
+                && target.threadID == nil
+        case .relay:
+            return target.workspacePath != nil
+                && (
+                    (target.mode == .threadSelected
+                        && target.threadID != nil
+                        && target.threadWorkingDirectoryPath != nil)
+                        || (target.mode == .newThreadPending
+                            && target.threadID == nil
+                            && target.threadWorkingDirectoryPath == nil)
+                )
+        case .leaveFocus, .status:
+            if target.mode == nil {
+                return target.workspacePath == nil
+                    && target.threadWorkingDirectoryPath == nil
+                    && target.threadID == nil
+            }
+            return target.workspacePath != nil
+                && (target.mode == .threadSelected) == (target.threadID != nil)
+        }
+    }
+}
+
+extension DelegateTaskAuthorizationDenialReason: Error {}

@@ -76,6 +76,31 @@ struct DelegateTaskPersistedRecord: Codable, Sendable, Equatable {
     /// when this Codex thread was created. `nil` identifies a legacy thread;
     /// dynamic tools cannot be retrofitted onto an existing app-server thread.
     var effectReportingContractVersion: Int?
+    /// Explicit project-chat relays share the completion/event ledger but are
+    /// not ordinary `delegate_task` work and must never become its implicit
+    /// active-task target. Optional keeps every existing schema-1 ledger valid.
+    var isProjectChat: Bool?
+}
+
+public enum CodexProjectChatFocusMode: String, Codable, Sendable, Equatable {
+    case projectSelected = "project_selected"
+    case threadSelected = "thread_selected"
+    case newThreadPending = "new_thread_pending"
+}
+
+/// Durable, host-resolved location of the Codex work Aurora was explicitly
+/// asked to focus. Natural-language selection is resolved by Realtime; this
+/// record stores only exact resource identity and never acts as authorization.
+struct CodexProjectChatPersistedFocus: Codable, Sendable, Equatable {
+    var mode: CodexProjectChatFocusMode
+    var projectName: String
+    var workspacePath: String
+    /// Exact cwd for a selected existing thread. Optional keeps older state
+    /// readable and is nil for project-only/new-thread focus.
+    var threadWorkspacePath: String?
+    var threadID: String?
+    var threadName: String?
+    var taskID: String?
 }
 
 enum DelegateTaskOperationLedgerEvent: String, Codable, Sendable, Equatable {
@@ -115,10 +140,20 @@ struct DelegateTaskPersistedState: Codable, Sendable, Equatable {
 
     let schemaVersion: Int
     var records: [DelegateTaskPersistedRecord]
+    var projectChatFocus: CodexProjectChatPersistedFocus?
+    /// Optional for schema-1 compatibility. New builds use it to invalidate
+    /// action envelopes prepared against an older focus selection.
+    var projectChatGeneration: UInt64?
 
-    init(records: [DelegateTaskPersistedRecord]) {
+    init(
+        records: [DelegateTaskPersistedRecord],
+        projectChatFocus: CodexProjectChatPersistedFocus? = nil,
+        projectChatGeneration: UInt64? = nil
+    ) {
         schemaVersion = Self.currentSchemaVersion
         self.records = records
+        self.projectChatFocus = projectChatFocus
+        self.projectChatGeneration = projectChatGeneration
     }
 }
 

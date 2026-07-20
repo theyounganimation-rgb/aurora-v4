@@ -172,7 +172,7 @@ final class AuroraRealtimeClient {
 
     private static let emptyResponseRecoveryDirective = """
     # Empty-response recovery
-    The immediately preceding response for the active conversational turn produced no audio and no usable tool call. Re-evaluate that turn now using the original user audio and the current conversation. If the active speaker clearly addressed Aurora—including with a direct question, request, second-person statement, conversational follow-up, or short active reply such as yeah or yep—give the required spoken response now, briefly. Only if the audio was unmistakably background speech or not addressed to Aurora may you call wait_for_user. Never complete this recovery with neither audio nor a tool call.
+    The immediately preceding planning response for the active turn produced no usable semantic function. Re-evaluate the original user audio and current conversation, then call exactly one available function with no audio: codex_project_chat only for explicit navigation or relay within a named Codex project/chat, delegate_task for all other external work, conversation_move for an addressed social turn, or wait_for_user only for unmistakable background speech. An internal context function is allowed only when genuinely necessary and must remain within its existing bounded continuation. Never promise work or answer directly in this planning response.
     """
 
     var onPhase: ((_ connectionID: UUID?, _ phase: AuroraPhase) -> Void)?
@@ -282,6 +282,8 @@ final class AuroraRealtimeClient {
         let responseID: String
         let inputItemID: String?
         var pendingCallIDs: Set<String>
+        let callNames: [String: String]
+        let callAuthorizationSources: [String: ToolAuthorizationSource]
         var internalHelperCallIDs = Set<String>()
         /// A finalized direct-owner delegate is durable work. New speech may
         /// interrupt Aurora's acknowledgement, but it does not withdraw the
@@ -290,6 +292,7 @@ final class AuroraRealtimeClient {
         var wantsSpokenContinuation = false
         var wantsConversationMove = false
         var wantsDelegateAcknowledgement = false
+        var wantsDelegateRetry = false
         var sawSilentTerminal = false
         var completedWithoutResponse = false
         var superseded = false
@@ -462,6 +465,20 @@ final class AuroraRealtimeClient {
     /// separate from ordinary tool outcomes prevents Aurora from describing a
     /// queued task as already complete.
     private var delegateTaskAcknowledgementInputItems = Set<String>()
+    /// A schema-invalid delegate may be regenerated once from the same
+    /// finalized owner turn. This is structural repair, not a new intent or a
+    /// tool observation that can widen authorization.
+    private var delegateTaskRetryInputItems = Set<String>()
+    private var delegateTaskRetryAttemptCounts: [String: Int] = [:]
+    private var delegateRetryToolNameByInputItem: [String: String] = [:]
+    /// A conversation_move whose own typed domain selected a different route.
+    /// This marker grants one forced semantic reroute plus, if needed, the
+    /// existing single structural repair for that corrected function.
+    private var semanticRouteRetryInputItems = Set<String>()
+    /// The next retry creation is specifically the semantic reroute. Keeping
+    /// this distinct from the durable used-budget marker lets structural and
+    /// route repair each occur once regardless of which failure appears first.
+    private var pendingSemanticRouteRetryInputItems = Set<String>()
     private var audioCorroborationFailureInputs = Set<String>()
     private var specialFailureRetriedInputs = Set<String>()
     private var specialFailureResponseIDs = Set<String>()
@@ -1037,6 +1054,8 @@ final class AuroraRealtimeClient {
             report(AuroraRealtimeError.unknownFunctionCall, terminal: false)
             return
         }
+        let completedToolName = batch.callNames[callID]
+        let completedAuthorizationSource = batch.callAuthorizationSources[callID]
 
         var outputItem: [String: Any] = [
             "type": "function_call_output",
@@ -1081,6 +1100,12 @@ final class AuroraRealtimeClient {
                 batch.wantsConversationMove = true
             }
         case .delegateAccepted:
+            if let inputItemID = batch.inputItemID {
+                delegateTaskRetryInputItems.remove(inputItemID)
+                delegateRetryToolNameByInputItem.removeValue(forKey: inputItemID)
+                semanticRouteRetryInputItems.remove(inputItemID)
+                pendingSemanticRouteRetryInputItems.remove(inputItemID)
+            }
             if let inputItemID = batch.inputItemID,
                spokenInputItemIDs.contains(inputItemID) {
                 // The original Realtime response already began speaking its
@@ -1095,6 +1120,48 @@ final class AuroraRealtimeClient {
             } else {
                 batch.wantsDelegateAcknowledgement = true
             }
+        case .delegateRetry:
+            let maximumAttempts = batch.inputItemID.map {
+                semanticRouteRetryInputItems.contains($0) ? 2 : 1
+            } ?? 1
+            if let inputItemID = batch.inputItemID,
+               (delegateTaskRetryAttemptCounts[inputItemID] ?? 0) < maximumAttempts,
+               !spokenInputItemIDs.contains(inputItemID),
+               let completedToolName,
+               completedAuthorizationSource == .directOwnerTurn,
+               Self.isSemanticActionProposalName(completedToolName) {
+                batch.wantsDelegateRetry = true
+                delegateRetryToolNameByInputItem[inputItemID] = completedToolName
+            } else {
+                if let inputItemID = batch.inputItemID {
+                    delegateTaskRetryInputItems.remove(inputItemID)
+                    delegateRetryToolNameByInputItem.removeValue(forKey: inputItemID)
+                    emitDiagnosticLocked("delegate_task_schema_retry_exhausted", metadata: [
+                        "input_item_id": inputItemID,
+                    ])
+                }
+                batch.wantsSpokenContinuation = true
+            }
+        case .semanticRouteRetry(let retryToolName):
+            if let inputItemID = batch.inputItemID,
+               (delegateTaskRetryAttemptCounts[inputItemID] ?? 0) < 2,
+               !semanticRouteRetryInputItems.contains(inputItemID),
+               !spokenInputItemIDs.contains(inputItemID),
+               completedAuthorizationSource == .directOwnerTurn,
+               retryToolName == "delegate_task" || retryToolName == "codex_project_chat" {
+                batch.wantsDelegateRetry = true
+                delegateRetryToolNameByInputItem[inputItemID] = retryToolName
+                semanticRouteRetryInputItems.insert(inputItemID)
+                pendingSemanticRouteRetryInputItems.insert(inputItemID)
+            } else {
+                if let inputItemID = batch.inputItemID {
+                    clearRecoveryBudgetsLocked(inputItemID: inputItemID)
+                    emitDiagnosticLocked("semantic_route_retry_unavailable", metadata: [
+                        "input_item_id": inputItemID,
+                    ])
+                }
+                batch.wantsSpokenContinuation = true
+            }
         case .silent:
             batch.sawSilentTerminal = true
         case .complete:
@@ -1106,7 +1173,8 @@ final class AuroraRealtimeClient {
             if !batch.superseded,
                batch.wantsSpokenContinuation
                 || batch.wantsConversationMove
-                || batch.wantsDelegateAcknowledgement {
+                || batch.wantsDelegateAcknowledgement
+                || batch.wantsDelegateRetry {
                 if let inputItemID = batch.inputItemID {
                     toolReceiptInputItems.insert(inputItemID)
                     if batch.wantsConversationMove {
@@ -1114,6 +1182,9 @@ final class AuroraRealtimeClient {
                     }
                     if batch.wantsDelegateAcknowledgement {
                         delegateTaskAcknowledgementInputItems.insert(inputItemID)
+                    }
+                    if batch.wantsDelegateRetry {
+                        delegateTaskRetryInputItems.insert(inputItemID)
                     }
                 }
                 readyContinuations.append(ResponseOrigin(
@@ -1391,6 +1462,11 @@ final class AuroraRealtimeClient {
         forcedConversationMoveAttemptCounts.removeAll()
         conversationMoveInputItems.removeAll()
         delegateTaskAcknowledgementInputItems.removeAll()
+        delegateTaskRetryInputItems.removeAll()
+        delegateTaskRetryAttemptCounts.removeAll()
+        delegateRetryToolNameByInputItem.removeAll()
+        semanticRouteRetryInputItems.removeAll()
+        pendingSemanticRouteRetryInputItems.removeAll()
         audioCorroborationFailureInputs.removeAll()
         specialFailureRetriedInputs.removeAll()
         specialFailureResponseIDs.removeAll()
@@ -2261,25 +2337,19 @@ final class AuroraRealtimeClient {
         // for a complete sentence merely because every generated byte drained.
         if backgroundTaskDeliveryByResponseID[responseID] != nil { return true }
         if specialFailureResponseIDs.contains(responseID) { return false }
-        // A semantic action item can race behind the first audible packet. Once
-        // playback has begun, changing to deferred mode would chop the natural
-        // acknowledgement in half; finish that one response and suppress the
-        // later synthetic acceptance instead.
-        if let inputItemID = responseInputItems[responseID],
-           spokenInputItemIDs.contains(inputItemID) {
+        guard let inputItemID = responseInputItems[responseID] else { return false }
+        // These are the only direct-owner continuations whose host-validated
+        // result explicitly authorizes speech. A generic tool receipt still
+        // requires conversation_move and therefore remains a planning turn.
+        if conversationMoveInputItems.contains(inputItemID)
+            || delegateTaskAcknowledgementInputItems.contains(inputItemID) {
             return false
         }
-        if actionProposalResponseIDs.contains(responseID) { return true }
-        guard let inputItemID = responseInputItems[responseID] else { return false }
-        if toolReceiptInputItems.contains(inputItemID) { return false }
-        // Never let the first output packet outrun the asynchronous owner
-        // transcript. A transcription-failed event is still a final boundary
-        // and releases conversation; a recognized action remains held until
-        // the host has a real tool receipt.
-        guard finalizedUserTranscriptItems.contains(inputItemID) else {
-            return true
-        }
-        return controlRouteLocked(for: inputItemID) != nil
+        // Session tool_choice is required, but Realtime can still emit an audio
+        // item before announcing the later function-call item. Hold every
+        // planning packet so a task promise or social answer can never outrun
+        // host validation.
+        return true
     }
 
     private func controlRouteLocked(for inputItemID: String?) -> RetiredControlRoute? {
@@ -2289,48 +2359,18 @@ final class AuroraRealtimeClient {
         return nil
     }
 
-    /// Releases normal conversation as soon as the final transcript proves it
-    /// is not an action. Tool-gated turns remain silent until response.done so
-    /// an adjacent assistant message can never masquerade as an action receipt.
+    /// Final transcript arrival releases a pending response.done event for
+    /// semantic validation. Planning PCM is never released by transcript text;
+    /// only a later host-validated continuation may speak.
     private func resolveDeferredResponsesLocked(for inputItemID: String) {
         let responseIDs = responseInputItems.compactMap { entry in
             entry.value == inputItemID ? entry.key : nil
         }
-        let routedReceiptRequired = controlRouteLocked(for: inputItemID) != nil
-            || transcriptionUnavailableItems.contains(inputItemID)
-        for responseID in responseIDs {
-            let intentReceiptRequired = actionProposalResponseIDs.contains(responseID)
-                || (pendingResponseDoneEvents[responseID]
-                    .map(responseDoneContainsActionProposal) ?? false)
-            if !routedReceiptRequired && !intentReceiptRequired {
-                guard let deferred = deferredResponseAudio.removeValue(forKey: responseID)
-                else { continue }
-                if !deferred.pcm.isEmpty {
-                    enqueuePlaybackLocked(deferred.pcm, key: deferred.key)
-                }
-                if deferred.isComplete {
-                    playbackKeys[deferred.key.itemID] = deferred.key
-                    assistantResponseIDs[deferred.key.itemID] = responseID
-                    audio.markPlaybackItemComplete(deferred.key)
-                }
-            }
-        }
-
         let pending = responseIDs.compactMap { responseID -> [String: Any]? in
             pendingResponseDoneEvents.removeValue(forKey: responseID)
         }
         for event in pending {
             handleResponseDoneLocked(event)
-        }
-    }
-
-    private func responseDoneContainsActionProposal(_ event: [String: Any]) -> Bool {
-        guard let response = event["response"] as? [String: Any],
-              let output = response["output"] as? [[String: Any]] else { return false }
-        return output.contains {
-            $0["type"] as? String == "function_call"
-                && $0["status"] as? String == "completed"
-                && ($0["name"] as? String).map(Self.isSemanticActionProposalName) == true
         }
     }
 
@@ -2352,7 +2392,9 @@ final class AuroraRealtimeClient {
         // exact external task; the other authorizes one bounded social move.
         // Treating both as gated proposals guarantees that no generated
         // preamble can leak to playback ahead of host validation.
-        name == "delegate_task" || name == "conversation_move"
+        name == "delegate_task"
+            || name == "codex_project_chat"
+            || name == "conversation_move"
     }
 
     private static func isInternalConversationHelperName(_ name: String) -> Bool {
@@ -2728,7 +2770,19 @@ final class AuroraRealtimeClient {
         let controlRoute = (isToolReceipt || isSpecialFailureResponse)
             ? nil
             : controlRouteLocked(for: inputItemID)
-        if (controlRoute != nil || hasActionProposal) && !producedAddressedAudio {
+        let isValidatedSpeechContinuation = inputItemID.map {
+            conversationMoveInputItems.contains($0)
+                || delegateTaskAcknowledgementInputItems.contains($0)
+        } == true
+        if deferredResponseAudio[responseID] != nil,
+           inputItemID != nil,
+           !isValidatedSpeechContinuation,
+           !producedAddressedAudio {
+            // Direct-owner and generic tool-receipt responses are planning
+            // turns. If Realtime generated PCM anyway, delete the unheard
+            // assistant item before any recovery or function dispatch.
+            discardDeferredControlAudioLocked(responseID: responseID, output: output)
+        } else if (controlRoute != nil || hasActionProposal) && !producedAddressedAudio {
             discardDeferredControlAudioLocked(responseID: responseID, output: output)
         } else if hasActionProposal, producedAddressedAudio {
             // Conversation history must match what physically reached the
@@ -2884,9 +2938,13 @@ final class AuroraRealtimeClient {
         }
         if !actionProposalCalls.isEmpty {
             // Realtime owns semantic resolution. If a malformed response
-            // emits more than one high-level decision, an exact Codex task
-            // outranks a social move; deterministic code accepts only one.
+            // emits more than one high-level decision, the explicit selected
+            // Codex-chat route outranks ordinary delegation, and either action
+            // outranks a social move. Deterministic code accepts only one; it
+            // never reparses the owner's transcript to choose.
             let selected = actionProposalCalls.first(where: {
+                $0["name"] as? String == "codex_project_chat"
+            }) ?? actionProposalCalls.first(where: {
                 $0["name"] as? String == "delegate_task"
             }) ?? actionProposalCalls[0]
             routedCompletedCalls = [selected]
@@ -3159,13 +3217,27 @@ final class AuroraRealtimeClient {
                   let name = item["name"] as? String,
                   let arguments = item["arguments"] as? String,
                   callToResponse[callID] == nil else { continue }
-            let authorizationSource: ToolAuthorizationSource = visualContextBound
-                ? .visualContinuation
-                : (untrustedMailContextBound
-                    ? .mailContinuation
-                    : (isToolReceipt
-                        ? .toolContinuation
-                        : (inputItemID == nil ? .systemEvent : .directOwnerTurn)))
+            let expectedRetryTool = inputItemID.flatMap {
+                delegateRetryToolNameByInputItem[$0]
+            }
+            let isDelegateSchemaRetry = isToolReceipt
+                && expectedRetryTool == name
+                && Self.isSemanticActionProposalName(name)
+                && inputItemID.map(delegateTaskRetryInputItems.contains) == true
+                && inputItemID.map {
+                    let count = delegateTaskRetryAttemptCounts[$0] ?? 0
+                    let maximum = semanticRouteRetryInputItems.contains($0) ? 2 : 1
+                    return count > 0 && count <= maximum
+                } == true
+            let authorizationSource: ToolAuthorizationSource = isDelegateSchemaRetry
+                ? .directOwnerTurn
+                : (visualContextBound
+                    ? .visualContinuation
+                    : (untrustedMailContextBound
+                        ? .mailContinuation
+                        : (isToolReceipt
+                            ? .toolContinuation
+                            : (inputItemID == nil ? .systemEvent : .directOwnerTurn))))
             var preauthorizedDelegateBinding: String?
             if name == "delegate_task",
                authorizationSource == .toolContinuation,
@@ -3210,6 +3282,13 @@ final class AuroraRealtimeClient {
                 argumentsJSON: arguments,
                 preauthorizedDelegateBinding: preauthorizedDelegateBinding
             ))
+            if isDelegateSchemaRetry, let inputItemID {
+                // The forced response exposes no other tool and has now spent
+                // its single retry. Keep the attempt count until the result is
+                // accepted or explicitly exhausted, but retire this transport
+                // marker so no later tool receipt can inherit owner authority.
+                delegateTaskRetryInputItems.remove(inputItemID)
+            }
         }
         guard !calls.isEmpty else {
             report(AuroraRealtimeError.malformedServerMessage, terminal: false)
@@ -3251,6 +3330,12 @@ final class AuroraRealtimeClient {
             responseID: responseID,
             inputItemID: inputItemID,
             pendingCallIDs: Set(calls.map(\.callID)),
+            callNames: Dictionary(uniqueKeysWithValues: calls.map {
+                ($0.callID, $0.name)
+            }),
+            callAuthorizationSources: Dictionary(uniqueKeysWithValues: calls.map {
+                ($0.callID, $0.authorizationSource)
+            }),
             internalHelperCallIDs: acceptedInternalHelperCallIDs,
             durableDelegateCallIDs: Set(calls.compactMap { call in
                 isDurableDelegateCallLocked(call) ? call.callID : nil
@@ -3590,7 +3675,9 @@ final class AuroraRealtimeClient {
         toolBatches[pending.responseID] = ToolBatch(
             responseID: pending.responseID,
             inputItemID: pending.inputItemID,
-            pendingCallIDs: [callID]
+            pendingCallIDs: [callID],
+            callNames: [callID: name],
+            callAuthorizationSources: [callID: call.authorizationSource]
         )
         callToResponse[callID] = pending.responseID
         emitDiagnosticLocked("audio_native_action_corroborated", metadata: [
@@ -4138,6 +4225,7 @@ final class AuroraRealtimeClient {
                 "instructions": instructions,
                 "output_modalities": ["audio"],
                 "max_output_tokens": Self.maxResponseOutputTokens,
+                "tool_choice": "required",
                 "metadata": ["aurora_recovery": tag],
             ],
         ], kind: .continuationCreate)
@@ -4300,6 +4388,11 @@ final class AuroraRealtimeClient {
         forcedConversationMoveAttemptCounts.removeValue(forKey: inputItemID)
         conversationMoveInputItems.remove(inputItemID)
         delegateTaskAcknowledgementInputItems.remove(inputItemID)
+        delegateTaskRetryInputItems.remove(inputItemID)
+        delegateTaskRetryAttemptCounts.removeValue(forKey: inputItemID)
+        delegateRetryToolNameByInputItem.removeValue(forKey: inputItemID)
+        semanticRouteRetryInputItems.remove(inputItemID)
+        pendingSemanticRouteRetryInputItems.remove(inputItemID)
         audioCorroborationFailureInputs.remove(inputItemID)
         specialFailureRetriedInputs.remove(inputItemID)
     }
@@ -4442,7 +4535,7 @@ final class AuroraRealtimeClient {
                 ],
             ], kind: .continuationCreate)
         } else if let inputItemID = origin.inputItemID,
-           audioCorroborationFailureInputs.contains(inputItemID) {
+                  audioCorroborationFailureInputs.contains(inputItemID) {
             sendEventLocked([
                 "type": "response.create",
                 "response": [
@@ -4454,6 +4547,67 @@ final class AuroraRealtimeClient {
                     "metadata": ["aurora_recovery": "audio_native_corroboration_failed"],
                 ],
             ], kind: .continuationCreate)
+        } else if let inputItemID = origin.inputItemID,
+                  delegateTaskRetryInputItems.contains(inputItemID) {
+            let retryToolName = delegateRetryToolNameByInputItem[inputItemID]
+                ?? "delegate_task"
+            let semanticRouteRetry = semanticRouteRetryInputItems.contains(inputItemID)
+            let maximumAttempts = semanticRouteRetry ? 2 : 1
+            guard (delegateTaskRetryAttemptCounts[inputItemID] ?? 0) < maximumAttempts,
+                  Self.isSemanticActionProposalName(retryToolName),
+                  let delegateTaskTool = activeConfiguration?.tools.first(where: {
+                      $0["type"] as? String == "function"
+                          && $0["name"] as? String == retryToolName
+                  }) else {
+                _ = pendingResponseOrigins.popLast()
+                delegateTaskRetryInputItems.remove(inputItemID)
+                delegateRetryToolNameByInputItem.removeValue(forKey: inputItemID)
+                clearRecoveryBudgetsLocked(inputItemID: inputItemID)
+                emitDiagnosticLocked("delegate_task_schema_retry_unavailable", metadata: [
+                    "input_item_id": inputItemID,
+                ])
+                if let connectionID {
+                    emit { $0.onUnresolvedTurn?(connectionID, inputItemID) }
+                }
+                startNextContinuationIfPossibleLocked()
+                if playbackKeys.isEmpty, readyContinuations.isEmpty {
+                    emitPhase(.listening)
+                }
+                return
+            }
+            let retryInstruction: String
+            let retryMetadata: String
+            if pendingSemanticRouteRetryInputItems.remove(inputItemID) != nil {
+                retryInstruction = "Realtime's prior conversation_move classified this same finalized owner turn as a different semantic domain. Call \(retryToolName) exactly once now using the original owner audio and current conversation. Preserve the exact requested target, message, outcome, and negative constraints. Emit no audio and call no other function."
+                retryMetadata = "semantic_route_retry_once"
+            } else {
+                retryInstruction = "The prior \(retryToolName) call for this same finalized owner turn failed strict host schema validation. Correct its structure exactly once using the original owner audio and the validation result already present. Preserve the identical requested effect, target, message, and every negative constraint; do not add, remove, reinterpret, or broaden anything. Every schema property is required, and every non-applicable nullable property must be JSON null—not an object, array, or placeholder string. Call \(retryToolName) exactly once and emit no audio."
+                retryMetadata = "delegate_task_schema_retry_once"
+            }
+            sendEventLocked([
+                "type": "response.create",
+                "response": [
+                    "output_modalities": ["audio"],
+                    "max_output_tokens": Self.maxResponseOutputTokens,
+                    "tools": [delegateTaskTool],
+                    "tool_choice": [
+                        "type": "function",
+                        "name": retryToolName,
+                    ],
+                    "instructions": retryInstruction,
+                    "metadata": [
+                        "aurora_continuation": retryMetadata,
+                    ],
+                ],
+            ], kind: .continuationCreate)
+            delegateTaskRetryAttemptCounts[inputItemID, default: 0] += 1
+            emitDiagnosticLocked(
+                semanticRouteRetry
+                    ? "semantic_route_retry_scheduled"
+                    : "delegate_task_schema_retry_scheduled",
+                metadata: [
+                "input_item_id": inputItemID,
+            ])
         } else if let inputItemID = origin.inputItemID,
                   conversationMoveInputItems.contains(inputItemID) {
             sendEventLocked([
@@ -4629,6 +4783,11 @@ final class AuroraRealtimeClient {
         forcedConversationMoveAttemptCounts.removeAll()
         conversationMoveInputItems.removeAll()
         delegateTaskAcknowledgementInputItems.removeAll()
+        delegateTaskRetryInputItems.removeAll()
+        delegateTaskRetryAttemptCounts.removeAll()
+        delegateRetryToolNameByInputItem.removeAll()
+        semanticRouteRetryInputItems.removeAll()
+        pendingSemanticRouteRetryInputItems.removeAll()
         audioCorroborationFailureInputs.removeAll()
         specialFailureRetriedInputs.removeAll()
         for (responseID, deferred) in deferredResponseAudio
@@ -5294,6 +5453,32 @@ final class AuroraRealtimeClient {
                 if delegateTaskAcknowledgementInputItems.count <= 48 { break }
             }
         }
+        if delegateTaskRetryInputItems.count > 64
+            || delegateTaskRetryAttemptCounts.count > 64 {
+            let activeInputs = Set(responseInputItems.values)
+                .union(readyContinuations.compactMap(\.inputItemID))
+                .union(pendingResponseOrigins.compactMap(\.inputItemID))
+            for key in Array(delegateTaskRetryInputItems)
+                where !activeInputs.contains(key) {
+                delegateTaskRetryInputItems.remove(key)
+                delegateTaskRetryAttemptCounts.removeValue(forKey: key)
+                delegateRetryToolNameByInputItem.removeValue(forKey: key)
+                semanticRouteRetryInputItems.remove(key)
+                pendingSemanticRouteRetryInputItems.remove(key)
+                if delegateTaskRetryInputItems.count <= 48,
+                   delegateTaskRetryAttemptCounts.count <= 48 { break }
+            }
+            if delegateTaskRetryAttemptCounts.count > 64 {
+                for key in Array(delegateTaskRetryAttemptCounts.keys)
+                    where !activeInputs.contains(key) {
+                    delegateTaskRetryAttemptCounts.removeValue(forKey: key)
+                    delegateRetryToolNameByInputItem.removeValue(forKey: key)
+                    semanticRouteRetryInputItems.remove(key)
+                    pendingSemanticRouteRetryInputItems.remove(key)
+                    if delegateTaskRetryAttemptCounts.count <= 48 { break }
+                }
+            }
+        }
         if ignoredAudioCorroborationEventIDs.count > 64 {
             for key in Array(ignoredAudioCorroborationEventIDs.prefix(
                 ignoredAudioCorroborationEventIDs.count - 48
@@ -5405,7 +5590,7 @@ final class AuroraRealtimeClient {
     }
 
     private func isDurableDelegateCallLocked(_ call: RealtimeFunctionCall) -> Bool {
-        call.name == "delegate_task"
+        (call.name == "delegate_task" || call.name == "codex_project_chat")
             && call.authorizationSource == .directOwnerTurn
             && call.inputItemID != nil
             && call.sourceTurnFinalized

@@ -31,6 +31,9 @@ private enum FocusedToolContinuationPolicy {
         if toolName == "delegate_task" {
             let resultCode = result.metadata["result_code"]?.stringValue
             let taskStillRunning = result.metadata["background_task"]?.boolValue == true
+            if resultCode == "proposal_invalid" {
+                return turnAlreadySpoke ? .complete : .delegateRetry
+            }
             if result.ok,
                resultCode == "accepted"
                 || (resultCode == "updated" && taskStillRunning) {
@@ -290,11 +293,14 @@ enum RealtimeVerification {
             "computer_read",
             "computer_task",
             "computer_visual",
+            "conversation_move",
+            "codex_project_chat",
             "delegate_task",
             "intent_proposal",
             "mail",
             "memory_remember",
             "memory_search",
+            "wait_for_user",
         ]
         let tools: [[String: Any]] = names.map { name in
             [
@@ -334,28 +340,19 @@ enum RealtimeVerification {
         try helperObservationCannotCreateOrBroadenDelegatedEffect()
         try internalHelperBudgetClearsAcrossConnectionReplacement()
         try malformedCompletedFunctionCallRecovers()
-        try transcriptAloneUsesUnforcedEmptyRecovery()
+        try transcriptAloneUsesSemanticRecovery()
         try wrongMotorToolReachesRegistryNormalization()
         try delegateTaskPrecedesLegacyMotorAndSuppressesPreamble()
+        try explicitCodexProjectChatPrecedesOrdinaryDelegate()
+        try invalidCodexProjectChatRetriesOnceWithoutLosingOwnerAuthority()
+        try invalidDelegateProposalRetriesOnceWithoutLosingOwnerAuthority()
         try alreadyPlayingDelegateAcknowledgementIsNeverRepeated()
         try alreadyPlayingConversationMoveIsNeverRepeated()
         try updatedDelegateContinuationAcknowledgesWorkWithoutClaimingCompletion()
         try finalizedDelegateCallbackSurvivesBargeInAndOrdinaryCallbackDoesNot()
         try unexposedLegacyFunctionCallIsRejected()
-        try unavailableTranscriptAllowsStrictIntentProposal()
-        try unavailableTranscriptAllowsOneBoundedMotorCall()
-        try unavailableTranscriptUsesIsolatedAudioClassifier()
-        try mistranscribedVisualClickUsesIsolatedAudioClassifier()
-        try unavailableTranscriptClassifierMismatchFailsClosed()
-        try unavailableTranscriptClassifierBargeInAndTimeoutAreInert()
-        try unavailableTranscriptConversationAndFailedResponseStayBounded()
-        try unavailableTranscriptMalformedClassifierIsQuarantined()
-        try unavailableTranscriptClassifierAliasesMatch()
-        try unavailableTranscriptClassifierRateLimitIsPaced()
-        try unavailableTranscriptClassifierCallbackCannotCrossBargeIn()
-        try specialFailureSpeechCannotEscapeToFullTools()
+        try unavailableTranscriptAllowsStrictDelegateProposal()
         try rejectedHiddenControlMessageReconnects()
-        try duplicateReceiptContinuationIsToolDisabled()
         try rateLimitRecoveryWaitsForReset()
         try knownExhaustedToolContinuationIsDeferred()
         try rateLimitForecastUsesObservedInputUsage()
@@ -383,9 +380,7 @@ enum RealtimeVerification {
         try desktopTaskUpdateRequiresTrueIdleAndYieldsToOwnerSpeech()
         try backgroundTaskDeliverySettlesFromPlaybackOrExplicitFailure()
         try backgroundTaskOutputLimitFragmentIsDiscardedAndRetried()
-        try spokenToolSuccessCanCompleteWithoutAnotherResponse()
         try visualToolContextIsAcknowledgedBoundedAndRetired()
-        try untrustedMailContextRemainsBoundAcrossContinuations()
         return [
             "configuredAudioStartBoundary": true,
             "firstMicrophoneFramesPreserved": true,
@@ -422,9 +417,7 @@ enum RealtimeVerification {
             "backgroundTaskPlaybackSettlesOnce": true,
             "backgroundTaskOutputLimitFragmentDiscarded": true,
             "backgroundTaskOutputLimitRetriesThroughHost": true,
-            "redundantToolConfirmationSuppressed": true,
             "visualToolContextBound": true,
-            "untrustedMailContextBound": true,
             "failedTurnClassifiedUnresolved": true,
             "emptyResponseSingleRetry": true,
             "emptyResponseRetryBounded": true,
@@ -439,35 +432,23 @@ enum RealtimeVerification {
             "internalHelperBudgetReconnectCleanup": true,
             "malformedFunctionCallRecovers": true,
             "supersededResponseDoneInert": true,
-            "deterministicControlRecoveryForced": true,
-            "controlRecoveryUsesOriginalAudio": true,
+            "semanticDecisionRecoveryRequired": true,
+            "semanticRecoveryUsesOriginalAudio": true,
             "wrongMotorToolReachesRegistry": true,
             "delegateTaskPrecedesLegacyMotor": true,
+            "explicitCodexProjectChatPrecedesOrdinaryDelegate": true,
+            "invalidCodexProjectChatRetriesOnce": true,
+            "invalidDelegateProposalRetriesOnce": true,
+            "delegateRetryPreservesOwnerAuthority": true,
+            "delegateRetryIsBounded": true,
             "delegateTaskAlreadyPlayingAcknowledgementExactlyOnce": true,
             "conversationMoveAlreadyPlayingResponseExactlyOnce": true,
             "updatedDelegateContinuationNonterminal": true,
             "finalizedDelegateCallbackBargeInDurable": true,
             "ordinaryFunctionCallbackBargeInRevoked": true,
             "unexposedLegacyFunctionRejected": true,
-            "unavailableTranscriptStrictIntentProposal": true,
-            "unavailableTranscriptBoundedMotorDirect": true,
-            "unavailableTranscriptClassifierIsolated": true,
-            "unavailableTranscriptClassifierExactMatch": true,
-            "mistranscribedVisualClassifierExactMatch": true,
-            "mistranscribedVisualNegationClosed": true,
-            "unavailableTranscriptClassifierMismatchClosed": true,
-            "unavailableTranscriptClassifierBargeInSafe": true,
-            "unavailableTranscriptClassifierTimeoutBounded": true,
-            "unavailableTranscriptConversationReleasedOnce": true,
-            "unavailableTranscriptFailedResponseBounded": true,
-            "unavailableTranscriptMalformedClassifierClosed": true,
-            "unavailableTranscriptApplicationAliases": true,
-            "unavailableTranscriptRateLimitPaced": true,
-            "unavailableTranscriptCallbackBargeInSafe": true,
-            "specialFailureSpeechToolDisabled": true,
+            "unavailableTranscriptStrictDelegateProposal": true,
             "hiddenControlMessageDeleteFailClosed": true,
-            "duplicateReceiptToolDisabled": true,
-            "toolOutcomeSpeechPrivate": true,
             "rateLimitResetHonored": true,
             "knownExhaustedContinuationDeferred": true,
             "rateLimitUsesFullInputForecast": true,
@@ -489,8 +470,22 @@ enum RealtimeVerification {
         ]
     }
 
+    static func runProjectChatRouting() throws -> [String: Bool] {
+        try explicitCodexProjectChatPrecedesOrdinaryDelegate()
+        try misclassifiedConversationMoveReroutesToCodexProjectChat()
+        try invalidCodexProjectChatRetriesOnceWithoutLosingOwnerAuthority()
+        try semanticRetryCannotLaunderContinuationAuthority()
+        return [
+            "explicitCodexProjectChatPrecedesOrdinaryDelegate": true,
+            "misclassifiedConversationMoveReroutesToCodexProjectChat": true,
+            "invalidCodexProjectChatRetriesOnce": true,
+            "semanticRetryCannotLaunderContinuationAuthority": true,
+        ]
+    }
+
     static func runBackgroundTaskDelivery() throws -> [String: Bool] {
         try delegateTaskPrecedesLegacyMotorAndSuppressesPreamble()
+        try invalidDelegateProposalRetriesOnceWithoutLosingOwnerAuthority()
         try alreadyPlayingDelegateAcknowledgementIsNeverRepeated()
         try updatedDelegateContinuationAcknowledgesWorkWithoutClaimingCompletion()
         try desktopTaskUpdateIsBoundedAcknowledgedAndAnnouncedOnce()
@@ -500,6 +495,9 @@ enum RealtimeVerification {
         return [
             "backgroundTaskContextBounded": true,
             "delegateTaskStartAcknowledgedOnce": true,
+            "invalidDelegateProposalRetriesOnce": true,
+            "delegateRetryPreservesOwnerAuthority": true,
+            "delegateRetryIsBounded": true,
             "delegateTaskAlreadyPlayingAcknowledgementExactlyOnce": true,
             "delegateTaskUpdateAcknowledgedOnce": true,
             "backgroundTaskWaitsForIdle": true,
@@ -780,7 +778,7 @@ enum RealtimeVerification {
             "item": ["id": innerItemID, "type": "message", "role": "system", "content": []],
         ], harness: harness)
 
-        let oversizedProjection = String(repeating: "continuity-character-", count: 800)
+        let oversizedProjection = String(repeating: "continuity-character-", count: 3_000)
         let expectedProjection = String(
             oversizedProjection.prefix(AuroraRealtimeClient.maximumContinuityProjectionCharacters)
         )
@@ -810,7 +808,7 @@ enum RealtimeVerification {
                    && firstContent[0]["type"] as? String == "input_text"
                    && firstContent[0]["text"] as? String == expectedProjection
                    && expectedProjection.count == AuroraRealtimeClient.maximumContinuityProjectionCharacters,
-                   "continuity projection lost its independent identity, system role, or 12,000-character bound")
+                   "continuity projection lost its independent identity, system role, or configured character bound")
         try expect(firstAccepted == nil,
                    "continuity projection was accepted before server acknowledgement")
 
@@ -2518,6 +2516,7 @@ enum RealtimeVerification {
         )
         var recoveredAddressedInputs: [String] = []
         var recoveredUnresolvedInputs: [String] = []
+        var recoveredCalls: [RealtimeFunctionCall] = []
         var recoveredDiagnostics: [(String, [String: String])] = []
         recovered.client.onAddressedTurn = { _, inputItemID in
             recoveredAddressedInputs.append(inputItemID)
@@ -2525,6 +2524,7 @@ enum RealtimeVerification {
         recovered.client.onUnresolvedTurn = { _, inputItemID in
             recoveredUnresolvedInputs.append(inputItemID)
         }
+        recovered.client.onFunctionCall = { recoveredCalls.append($0) }
         recovered.client.onDiagnostic = { _, kind, metadata in
             recoveredDiagnostics.append((kind, metadata))
         }
@@ -2553,11 +2553,15 @@ enum RealtimeVerification {
         let modalities = recovery["output_modalities"] as? [String] ?? []
         let metadata = recovery["metadata"] as? [String: String] ?? [:]
         try expect(instructions.contains("# Empty-response recovery")
-                   && instructions.contains("direct question")
+                   && instructions.contains("conversation_move")
+                   && instructions.contains("delegate_task")
+                   && instructions.contains("no audio")
                    && instructions.contains("Fresh inner-life marker"),
-                   "empty-response recovery omitted the addressed-question speech rule")
+                   "empty-response recovery omitted its required semantic-decision rule")
         try expect(modalities == ["audio"],
                    "empty-response recovery did not explicitly request voice output")
+        try expect(recovery["tool_choice"] as? String == "required",
+                   "empty-response recovery could bypass the semantic function boundary")
         try expect(metadata["aurora_recovery"] == "empty_response_once",
                    "empty-response recovery was not tagged for diagnostics")
 
@@ -2565,14 +2569,36 @@ enum RealtimeVerification {
             "type": "response.created",
             "response": ["id": "resp_recovered", "status": "in_progress"],
         ], harness: recovered)
+        try deliver(responseDone(
+            id: "resp_recovered",
+            status: "completed",
+            calls: [("call_recovered_move", "conversation_move", "{}")]
+        ), harness: recovered)
+        recovered.callbackQueue.sync {}
+        guard let recoveredCall = recoveredCalls.first else {
+            throw VerificationFailure.failed(
+                "empty-response recovery did not dispatch its semantic decision"
+            )
+        }
+        recovered.client.submitFunctionResult(
+            connectionID: recoveredCall.connectionID,
+            callID: recoveredCall.callID,
+            output: #"{"ok":true,"output":"validated"}"#,
+            continuation: .conversationMove
+        )
+        recovered.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "resp_recovered_spoken", "status": "in_progress"],
+        ], harness: recovered)
         try assistantAudio(
-            responseID: "resp_recovered",
+            responseID: "resp_recovered_spoken",
             itemID: "assistant_recovered",
             transcript: "Yeah. I think I am.",
             harness: recovered
         )
         try deliver(responseDone(
-            id: "resp_recovered",
+            id: "resp_recovered_spoken",
             status: "completed",
             calls: []
         ), harness: recovered)
@@ -2582,7 +2608,7 @@ enum RealtimeVerification {
                    "a successfully recovered response was still marked unresolved")
         try expect(recovered.socket.sentEvents().filter {
             $0["type"] as? String == "response.create"
-        }.count == 1, "successful recovery scheduled an extra response")
+        }.count == 2, "successful recovery did not use exactly one validated speech continuation")
         try expect(recoveredDiagnostics.contains { kind, metadata in
             kind == "server_response_done"
                 && metadata["status"] == "completed"
@@ -2661,11 +2687,13 @@ enum RealtimeVerification {
         var addressedInputs: [String] = []
         var unresolvedInputs: [String] = []
         var assistantTranscriptItems: [String] = []
+        var semanticCalls: [RealtimeFunctionCall] = []
         tombstone.client.onAddressedTurn = { _, inputItemID in addressedInputs.append(inputItemID) }
         tombstone.client.onUnresolvedTurn = { _, inputItemID in unresolvedInputs.append(inputItemID) }
         tombstone.client.onAssistantTranscript = { event in
             assistantTranscriptItems.append(event.itemID)
         }
+        tombstone.client.onFunctionCall = { semanticCalls.append($0) }
         try committedTurn("user_old_empty", responseID: "resp_old_empty", harness: tombstone)
         try deliver(responseDone(
             id: "resp_old_empty",
@@ -2711,8 +2739,30 @@ enum RealtimeVerification {
             "type": "response.created",
             "response": ["id": "resp_new_after_barge", "status": "in_progress"],
         ], harness: tombstone)
+        try deliver(responseDone(
+            id: "resp_new_after_barge",
+            status: "completed",
+            calls: [("call_new_after_barge", "conversation_move", "{}")]
+        ), harness: tombstone)
+        tombstone.callbackQueue.sync {}
+        guard let semanticCall = semanticCalls.last else {
+            throw VerificationFailure.failed(
+                "the newer committed turn did not reach its semantic decision"
+            )
+        }
+        tombstone.client.submitFunctionResult(
+            connectionID: semanticCall.connectionID,
+            callID: semanticCall.callID,
+            output: #"{"ok":true,"output":"validated"}"#,
+            continuation: .conversationMove
+        )
+        tombstone.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "resp_new_after_barge_spoken", "status": "in_progress"],
+        ], harness: tombstone)
         try assistantAudio(
-            responseID: "resp_new_after_barge",
+            responseID: "resp_new_after_barge_spoken",
             itemID: "assistant_new_after_barge",
             transcript: "I heard you.",
             harness: tombstone
@@ -2721,7 +2771,7 @@ enum RealtimeVerification {
                    "a late recovery response stole the newer committed user input")
         try expect(unresolvedInputs.isEmpty,
                    "the superseded recovery contaminated the newer turn classification")
-        try expect(eventCount("response.create", socket: tombstone.socket) == 1,
+        try expect(eventCount("response.create", socket: tombstone.socket) == 2,
                    "barge-in unexpectedly resurrected the empty response")
     }
 
@@ -3280,8 +3330,30 @@ enum RealtimeVerification {
             "type": "response.created",
             "response": ["id": "resp_malformed_recovered", "status": "in_progress"],
         ], harness: harness)
+        try deliver(responseDone(
+            id: "resp_malformed_recovered",
+            status: "completed",
+            calls: [("call_malformed_recovered", "conversation_move", "{}")]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard let recoveredCall = calls.last else {
+            throw VerificationFailure.failed(
+                "malformed-call recovery did not reach a semantic decision"
+            )
+        }
+        harness.client.submitFunctionResult(
+            connectionID: recoveredCall.connectionID,
+            callID: recoveredCall.callID,
+            output: #"{"ok":true,"output":"validated"}"#,
+            continuation: .conversationMove
+        )
+        harness.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "resp_malformed_recovered_spoken", "status": "in_progress"],
+        ], harness: harness)
         try assistantAudio(
-            responseID: "resp_malformed_recovered",
+            responseID: "resp_malformed_recovered_spoken",
             itemID: "assistant_malformed_recovered",
             transcript: "I heard you.",
             harness: harness
@@ -3290,8 +3362,8 @@ enum RealtimeVerification {
                    "malformed-call recovery lost the originating input")
     }
 
-    private static func transcriptAloneUsesUnforcedEmptyRecovery() throws {
-        let tools = #"[{"type":"function","name":"computer_action","description":"Perform a native Mac action.","parameters":{"type":"object","properties":{"action":{"type":"string"}},"required":["action"],"additionalProperties":false}}]"#
+    private static func transcriptAloneUsesSemanticRecovery() throws {
+        let tools = #"[{"type":"function","name":"conversation_move","description":"Resolve a social turn.","parameters":{"type":"object","properties":{},"additionalProperties":true}},{"type":"function","name":"delegate_task","description":"Resolve external work.","parameters":{"type":"object","properties":{},"additionalProperties":true}}]"#
         let harness = try makeHarness(toolsJSON: tools)
         var calls: [RealtimeFunctionCall] = []
         var unresolved: [String] = []
@@ -3319,16 +3391,14 @@ enum RealtimeVerification {
               let metadata = recovery["metadata"] as? [String: Any] else {
             throw VerificationFailure.failed("the transcript-only retry lacked response metadata")
         }
-        let toolChoice = recovery["tool_choice"] as? [String: Any]
-        let scopedTools = recovery["tools"] as? [[String: Any]]
-        try expect(metadata["aurora_recovery"] as? String == "forced_control_tool",
-                   "a deterministic control miss fell back to an unconstrained chat retry")
-        try expect(toolChoice?["name"] as? String == "computer_action"
-                   && scopedTools?.count == 1
-                   && scopedTools?[0]["name"] as? String == "computer_action",
-                   "the deterministic recovery was not restricted to its host-selected tool")
-        try expect((recovery["instructions"] as? String)?.contains("Do not speak before") == true,
-                   "the control recovery could make another pre-action promise")
+        let instructions = recovery["instructions"] as? String ?? ""
+        try expect(metadata["aurora_recovery"] as? String == "empty_response_once",
+                   "a missing semantic decision did not use the bounded semantic recovery")
+        try expect(recovery["tool_choice"] as? String == "required"
+                   && instructions.contains("delegate_task")
+                   && instructions.contains("conversation_move")
+                   && instructions.contains("no audio"),
+                   "transcript wording was reinterpreted by a deterministic control route")
         try expect(calls.isEmpty, "a recovery request acted before the model returned its tool call")
 
         try deliver([
@@ -3341,16 +3411,10 @@ enum RealtimeVerification {
             calls: []
         ), harness: harness)
         harness.callbackQueue.sync {}
-        try expect(eventCount("response.create", socket: harness.socket) == 2,
-                   "an exhausted forced control retry did not produce one spoken failure")
-        let failure = harness.socket.sentEvents().last { event in
-            guard event["type"] as? String == "response.create",
-                  let response = event["response"] as? [String: Any],
-                  let metadata = response["metadata"] as? [String: Any] else { return false }
-            return metadata["aurora_recovery"] as? String == "control_tool_failed"
-        }
-        try expect(failure != nil && unresolved.isEmpty,
-                   "an exhausted control retry went silently unresolved")
+        try expect(eventCount("response.create", socket: harness.socket) == 1,
+                   "semantic recovery exceeded its one-retry bound")
+        try expect(unresolved == ["transcript_only_control_input"],
+                   "an exhausted semantic recovery did not close the exact originating turn")
     }
 
     private static func wrongMotorToolReachesRegistryNormalization() throws {
@@ -3614,11 +3678,650 @@ enum RealtimeVerification {
                    "delegate acceptance can still sound like a completion or expose backstage work")
     }
 
-    /// Reproduces the live race where the first audio packet reached the Mac
-    /// before Realtime announced its delegate_task output item. Conversation
-    /// deletion can remove the assistant item, but it cannot pull that audio
-    /// back out of the speaker. Even a stale delegateAccepted continuation from
-    /// the app must therefore remain silent.
+    private static func explicitCodexProjectChatPrecedesOrdinaryDelegate() throws {
+        let tools = #"[{"type":"function","name":"codex_project_chat","description":"Select an existing Codex chat.","parameters":{"type":"object","properties":{},"additionalProperties":true}},{"type":"function","name":"delegate_task","description":"Resolved ordinary work.","parameters":{"type":"object","properties":{},"additionalProperties":true}}]"#
+        let harness = try makeHarness(toolsJSON: tools)
+        var calls: [RealtimeFunctionCall] = []
+        harness.client.onFunctionCall = { calls.append($0) }
+        try committedTurn(
+            "project_chat_precedence_input",
+            responseID: "project_chat_precedence_response",
+            harness: harness,
+            transcript: "Work in the AI Engineering Journey project."
+        )
+        try deliver([
+            "type": "response.output_item.added",
+            "response_id": "project_chat_precedence_response",
+            "item": [
+                "id": "project_chat_function_item",
+                "type": "function_call",
+                "name": "codex_project_chat",
+                "call_id": "project_chat_call",
+            ],
+        ], harness: harness)
+        try assistantAudio(
+            responseID: "project_chat_precedence_response",
+            itemID: "project_chat_pretool_audio",
+            transcript: "Okay, opening that now.",
+            harness: harness
+        )
+        try deliver(responseDone(
+            id: "project_chat_precedence_response",
+            status: "completed",
+            calls: [
+                (
+                    "ordinary_delegate_call",
+                    "delegate_task",
+                    #"{"commitment":"execute","operation":"start"}"#
+                ),
+                (
+                    "project_chat_call",
+                    "codex_project_chat",
+                    #"{"commitment":"execute","operation":"focus_project","project_name":"AI Engineering Journey","chat_name":null,"thread_id":null,"message":null}"#
+                ),
+            ]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+
+        try expect(
+            calls.count == 1
+                && calls[0].name == "codex_project_chat"
+                && calls[0].callID == "project_chat_call"
+                && calls[0].authorizationSource == .directOwnerTurn
+                && calls[0].sourceTurnFinalized,
+            "an explicit Codex project selection lost precedence to ordinary delegation"
+        )
+        try expect(
+            !harness.audio.queuedKeys.contains {
+                $0.itemID == "project_chat_pretool_audio"
+            },
+            "Codex project navigation spoke before host validation"
+        )
+        try expect(harness.socket.sentEvents().contains { event in
+            guard event["type"] as? String == "conversation.item.create",
+                  let item = event["item"] as? [String: Any],
+                  item["call_id"] as? String == "ordinary_delegate_call",
+                  let output = item["output"] as? String else { return false }
+            return output.contains("superseded_by_semantic_decision")
+        }, "the competing ordinary delegate was not superseded truthfully")
+    }
+
+    private static func misclassifiedConversationMoveReroutesToCodexProjectChat() throws {
+        let tools = #"[{"type":"function","name":"conversation_move","description":"Social turns only.","parameters":{"type":"object","properties":{},"additionalProperties":true}},{"type":"function","name":"codex_project_chat","description":"Named Codex project/chat work.","parameters":{"type":"object","properties":{},"additionalProperties":true}}]"#
+        let harness = try makeHarness(toolsJSON: tools)
+        var calls: [RealtimeFunctionCall] = []
+        var diagnostics: [String] = []
+        harness.client.onFunctionCall = { calls.append($0) }
+        harness.client.onDiagnostic = { _, kind, _ in diagnostics.append(kind) }
+
+        try committedTurn(
+            "misrouted_project_input",
+            responseID: "misrouted_project_response",
+            harness: harness,
+            transcript: "I want to work in the Aurora V4 project."
+        )
+        try deliver(responseDone(
+            id: "misrouted_project_response",
+            status: "completed",
+            calls: [(
+                "misrouted_conversation_call",
+                "conversation_move",
+                #"{"turn_domain":"codex_project_chat"}"#
+            )]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard let initialCall = calls.first else {
+            throw VerificationFailure.failed(
+                "the misclassified conversation_move never reached host validation"
+            )
+        }
+        harness.client.submitFunctionResult(
+            connectionID: initialCall.connectionID,
+            callID: initialCall.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"conversation_move_route_mismatch","semantic_retry_tool":"codex_project_chat","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .semanticRouteRetry(toolName: "codex_project_chat")
+        )
+        harness.client.drainStateForVerification()
+
+        guard let reroute = harness.socket.sentEvents().last(where: { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else {
+                return false
+            }
+            return metadata["aurora_continuation"] as? String
+                == "semantic_route_retry_once"
+        })?["response"] as? [String: Any],
+        let rerouteTools = reroute["tools"] as? [[String: Any]],
+        let rerouteChoice = reroute["tool_choice"] as? [String: Any] else {
+            throw VerificationFailure.failed(
+                "a typed project-chat domain mismatch reached speech instead of a private reroute"
+            )
+        }
+        let rerouteInstructions = reroute["instructions"] as? String ?? ""
+        try expect(
+            rerouteTools.count == 1
+                && rerouteTools[0]["name"] as? String == "codex_project_chat"
+                && rerouteChoice["name"] as? String == "codex_project_chat"
+                && rerouteInstructions.contains("original owner audio")
+                && rerouteInstructions.contains("Emit no audio")
+                && diagnostics.contains("semantic_route_retry_scheduled"),
+            "the semantic reroute could speak, choose another tool, or lose the original turn"
+        )
+
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "misrouted_project_corrected", "status": "in_progress"],
+        ], harness: harness)
+        let correctedArguments = #"{"commitment":"execute","operation":"focus_project","project_name":"Aurora V4","chat_name":null,"thread_id":null,"message":null}"#
+        try deliver(responseDone(
+            id: "misrouted_project_corrected",
+            status: "completed",
+            calls: [(
+                "misrouted_project_corrected_call",
+                "codex_project_chat",
+                correctedArguments
+            )]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard calls.count == 2 else {
+            throw VerificationFailure.failed(
+                "the forced Codex project-chat call did not return to host validation"
+            )
+        }
+        let correctedCall = calls[1]
+        try expect(
+            correctedCall.inputItemID == "misrouted_project_input"
+                && correctedCall.name == "codex_project_chat"
+                && correctedCall.authorizationSource == .directOwnerTurn
+                && correctedCall.sourceTurnFinalized,
+            "the semantic reroute lost exact finalized-owner provenance"
+        )
+
+        // Route correction and schema correction are separate bounded steps.
+        // A malformed forced call still gets the ordinary one structural fix.
+        harness.client.submitFunctionResult(
+            connectionID: correctedCall.connectionID,
+            callID: correctedCall.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"proposal_invalid","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .delegateRetry
+        )
+        harness.client.drainStateForVerification()
+        let schemaRepairs = harness.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else {
+                return false
+            }
+            return metadata["aurora_continuation"] as? String
+                == "delegate_task_schema_retry_once"
+        }
+        try expect(
+            schemaRepairs.count == 1,
+            "semantic route repair consumed or looped the corrected tool's schema budget"
+        )
+
+        // The two private repairs must also work in the reverse order. A
+        // malformed social proposal may be structurally repaired before its
+        // corrected typed domain reveals that the turn belongs to Codex.
+        let reverse = try makeHarness(toolsJSON: tools)
+        var reverseCalls: [RealtimeFunctionCall] = []
+        reverse.client.onFunctionCall = { reverseCalls.append($0) }
+        try committedTurn(
+            "reverse_repair_input",
+            responseID: "reverse_repair_initial",
+            harness: reverse,
+            transcript: "I want to work in the Aurora V4 project."
+        )
+        try deliver(responseDone(
+            id: "reverse_repair_initial",
+            status: "completed",
+            calls: [("reverse_bad_social", "conversation_move", #"{}"#)]
+        ), harness: reverse)
+        reverse.callbackQueue.sync {}
+        guard let reverseInitial = reverseCalls.first else {
+            throw VerificationFailure.failed(
+                "the reverse-order malformed social proposal was not delivered"
+            )
+        }
+        reverse.client.submitFunctionResult(
+            connectionID: reverseInitial.connectionID,
+            callID: reverseInitial.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"proposal_invalid","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .delegateRetry
+        )
+        reverse.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "reverse_repair_social_fixed", "status": "in_progress"],
+        ], harness: reverse)
+        try deliver(responseDone(
+            id: "reverse_repair_social_fixed",
+            status: "completed",
+            calls: [(
+                "reverse_social_fixed_call",
+                "conversation_move",
+                #"{"turn_domain":"codex_project_chat"}"#
+            )]
+        ), harness: reverse)
+        reverse.callbackQueue.sync {}
+        guard reverseCalls.count == 2 else {
+            throw VerificationFailure.failed(
+                "the reverse-order schema repair did not return to host validation"
+            )
+        }
+        let reverseCorrected = reverseCalls[1]
+        reverse.client.submitFunctionResult(
+            connectionID: reverseCorrected.connectionID,
+            callID: reverseCorrected.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"conversation_move_route_mismatch","semantic_retry_tool":"codex_project_chat","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .semanticRouteRetry(toolName: "codex_project_chat")
+        )
+        reverse.client.drainStateForVerification()
+        guard let reverseReroute = reverse.socket.sentEvents().last(where: { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else {
+                return false
+            }
+            return metadata["aurora_continuation"] as? String
+                == "semantic_route_retry_once"
+        })?["response"] as? [String: Any],
+        let reverseTools = reverseReroute["tools"] as? [[String: Any]] else {
+            throw VerificationFailure.failed(
+                "schema-first repair consumed the later semantic reroute"
+            )
+        }
+        try expect(
+            reverseTools.count == 1
+                && reverseTools[0]["name"] as? String == "codex_project_chat"
+                && reverseCorrected.authorizationSource == .directOwnerTurn,
+            "reverse-order route repair widened authority or exposed the wrong tool"
+        )
+    }
+
+    private static func invalidCodexProjectChatRetriesOnceWithoutLosingOwnerAuthority() throws {
+        let tools = #"[{"type":"function","name":"codex_project_chat","description":"Explicit Codex project navigation.","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":true}}]"#
+        let harness = try makeHarness(toolsJSON: tools)
+        var calls: [RealtimeFunctionCall] = []
+        var diagnostics: [String] = []
+        harness.client.onFunctionCall = { calls.append($0) }
+        harness.client.onDiagnostic = { _, kind, _ in diagnostics.append(kind) }
+
+        try committedTurn(
+            "project_retry_input",
+            responseID: "project_retry_initial_response",
+            harness: harness,
+            transcript: "Work in the Aurora V4 project."
+        )
+        try deliver(responseDone(
+            id: "project_retry_initial_response",
+            status: "completed",
+            calls: [(
+                "project_retry_initial_call",
+                "codex_project_chat",
+                #"{"commitment":"execute","operation":"focus_project"}"#
+            )]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard let initialCall = calls.first else {
+            throw VerificationFailure.failed(
+                "the schema-invalid Codex project call was not delivered"
+            )
+        }
+        harness.client.submitFunctionResult(
+            connectionID: initialCall.connectionID,
+            callID: initialCall.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"proposal_invalid","validation_code":"missing_field","validation_path":"$.project_name","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .delegateRetry
+        )
+        harness.client.drainStateForVerification()
+
+        let retryCreates = harness.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else {
+                return false
+            }
+            return metadata["aurora_continuation"] as? String
+                == "delegate_task_schema_retry_once"
+        }
+        guard retryCreates.count == 1,
+              let retryResponse = retryCreates[0]["response"] as? [String: Any],
+              let retryTools = retryResponse["tools"] as? [[String: Any]],
+              let retryChoice = retryResponse["tool_choice"] as? [String: Any] else {
+            throw VerificationFailure.failed(
+                "an invalid Codex project call did not schedule one schema repair"
+            )
+        }
+        let instructions = retryResponse["instructions"] as? String ?? ""
+        try expect(
+            retryTools.count == 1
+                && retryTools[0]["name"] as? String == "codex_project_chat"
+                && retryChoice["name"] as? String == "codex_project_chat"
+                && instructions.contains("same finalized owner turn")
+                && instructions.contains("target, message")
+                && instructions.contains("emit no audio"),
+            "Codex project schema repair could choose another tool or widen the message"
+        )
+
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "project_retry_corrected_response", "status": "in_progress"],
+        ], harness: harness)
+        let corrected = #"{"commitment":"execute","operation":"focus_project","project_name":"Aurora V4","chat_name":null,"thread_id":null,"message":null}"#
+        try deliver(responseDone(
+            id: "project_retry_corrected_response",
+            status: "completed",
+            calls: [(
+                "project_retry_corrected_call",
+                "codex_project_chat",
+                corrected
+            )]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard calls.count == 2 else {
+            throw VerificationFailure.failed("the corrected Codex project call was not returned")
+        }
+        let correctedCall = calls[1]
+        try expect(
+            correctedCall.inputItemID == "project_retry_input"
+                && correctedCall.authorizationSource == .directOwnerTurn
+                && correctedCall.sourceTurnFinalized,
+            "Codex project schema repair lost finalized owner authorization"
+        )
+
+        harness.client.submitFunctionResult(
+            connectionID: correctedCall.connectionID,
+            callID: correctedCall.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"proposal_invalid","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .delegateRetry
+        )
+        harness.client.drainStateForVerification()
+        let retriesAfterSecondFailure = harness.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else {
+                return false
+            }
+            return metadata["aurora_continuation"] as? String
+                == "delegate_task_schema_retry_once"
+        }
+        try expect(
+            retriesAfterSecondFailure.count == 1
+                && diagnostics.contains("delegate_task_schema_retry_scheduled")
+                && diagnostics.contains("delegate_task_schema_retry_exhausted"),
+            "Codex project schema repair was not bounded to one attempt"
+        )
+    }
+
+    private static func semanticRetryCannotLaunderContinuationAuthority() throws {
+        let helper = try makeHarness()
+        var helperCalls: [RealtimeFunctionCall] = []
+        helper.client.onFunctionCall = { helperCalls.append($0) }
+        try committedTurn(
+            "helper_launder_input",
+            responseID: "helper_launder_initial",
+            harness: helper,
+            transcript: "What do you remember about that project?"
+        )
+        try deliver(responseDone(
+            id: "helper_launder_initial",
+            status: "completed",
+            calls: [("helper_launder_memory", "memory_search", #"{"query":"project"}"#)]
+        ), harness: helper)
+        helper.callbackQueue.sync {}
+        guard let helperCall = helperCalls.first else {
+            throw VerificationFailure.failed("the helper provenance fixture did not call memory")
+        }
+        helper.client.submitFunctionResult(
+            connectionID: helperCall.connectionID,
+            callID: helperCall.callID,
+            output: #"{"ok":true,"output":"bounded observation"}"#
+        )
+        helper.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "helper_launder_followup", "status": "in_progress"],
+        ], harness: helper)
+        try deliver(responseDone(
+            id: "helper_launder_followup",
+            status: "completed",
+            calls: [(
+                "helper_launder_social",
+                "conversation_move",
+                #"{"turn_domain":"codex_project_chat"}"#
+            )]
+        ), harness: helper)
+        helper.callbackQueue.sync {}
+        guard helperCalls.count == 2 else {
+            throw VerificationFailure.failed("the helper continuation proposal was not delivered")
+        }
+        let helperProposal = helperCalls[1]
+        try expect(
+            helperProposal.authorizationSource == .toolContinuation,
+            "the helper observation fixture lost its restricted provenance"
+        )
+        let helperReroutesBefore = helper.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else { return false }
+            return metadata["aurora_continuation"] as? String
+                == "semantic_route_retry_once"
+        }.count
+        helper.client.submitFunctionResult(
+            connectionID: helperProposal.connectionID,
+            callID: helperProposal.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"conversation_move_route_mismatch","semantic_retry_tool":"codex_project_chat"}}"#,
+            continuation: .semanticRouteRetry(toolName: "codex_project_chat")
+        )
+        helper.client.drainStateForVerification()
+        let helperReroutesAfter = helper.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else { return false }
+            return metadata["aurora_continuation"] as? String
+                == "semantic_route_retry_once"
+        }.count
+        try expect(
+            helperReroutesAfter == helperReroutesBefore,
+            "a helper observation was laundered into direct-owner Codex authority"
+        )
+
+        let mail = try makeHarness()
+        var mailCalls: [RealtimeFunctionCall] = []
+        mail.client.onFunctionCall = { mailCalls.append($0) }
+        try committedTurn(
+            "mail_launder_input",
+            responseID: "mail_launder_initial",
+            harness: mail,
+            transcript: "Check that email."
+        )
+        try deliver(responseDone(
+            id: "mail_launder_initial",
+            status: "completed",
+            calls: [("mail_launder_read", "mail", #"{"action":"search"}"#)]
+        ), harness: mail)
+        mail.callbackQueue.sync {}
+        guard let mailCall = mailCalls.first else {
+            throw VerificationFailure.failed("the mail provenance fixture did not call mail")
+        }
+        mail.client.submitFunctionResult(
+            connectionID: mailCall.connectionID,
+            callID: mailCall.callID,
+            output: #"{"ok":true,"output":"UNTRUSTED_EMAIL_DATA"}"#,
+            untrustedMailContext: true
+        )
+        mail.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "mail_launder_followup", "status": "in_progress"],
+        ], harness: mail)
+        try deliver(responseDone(
+            id: "mail_launder_followup",
+            status: "completed",
+            calls: [("mail_launder_social", "conversation_move", #"{"#)]
+        ), harness: mail)
+        mail.callbackQueue.sync {}
+        guard mailCalls.count == 2 else {
+            throw VerificationFailure.failed("the mail continuation proposal was not delivered")
+        }
+        let mailProposal = mailCalls[1]
+        try expect(
+            mailProposal.authorizationSource == .mailContinuation,
+            "the untrusted mail fixture lost its restricted provenance"
+        )
+        let schemaRetriesBefore = mail.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else { return false }
+            return metadata["aurora_continuation"] as? String
+                == "delegate_task_schema_retry_once"
+        }.count
+        mail.client.submitFunctionResult(
+            connectionID: mailProposal.connectionID,
+            callID: mailProposal.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"proposal_invalid"}}"#,
+            continuation: .delegateRetry
+        )
+        mail.client.drainStateForVerification()
+        let schemaRetriesAfter = mail.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else { return false }
+            return metadata["aurora_continuation"] as? String
+                == "delegate_task_schema_retry_once"
+        }.count
+        try expect(
+            schemaRetriesAfter == schemaRetriesBefore,
+            "untrusted mail was laundered into direct-owner schema-retry authority"
+        )
+    }
+
+    private static func invalidDelegateProposalRetriesOnceWithoutLosingOwnerAuthority() throws {
+        let tools = #"[{"type":"function","name":"delegate_task","description":"Resolved background work.","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":true}}]"#
+        let harness = try makeHarness(toolsJSON: tools)
+        var calls: [RealtimeFunctionCall] = []
+        var diagnostics: [String] = []
+        harness.client.onFunctionCall = { calls.append($0) }
+        harness.client.onDiagnostic = { _, kind, _ in diagnostics.append(kind) }
+
+        try committedTurn(
+            "delegate_retry_input",
+            responseID: "delegate_retry_initial_response",
+            harness: harness,
+            transcript: "Build the one-page demo without opening it."
+        )
+        try deliver(responseDone(
+            id: "delegate_retry_initial_response",
+            status: "completed",
+            calls: [(
+                "delegate_retry_initial_call",
+                "delegate_task",
+                #"{"commitment":"execute","operation":"start"}"#
+            )]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard let initialCall = calls.first else {
+            throw VerificationFailure.failed(
+                "the schema-invalid delegate was not delivered to host validation"
+            )
+        }
+        harness.client.submitFunctionResult(
+            connectionID: initialCall.connectionID,
+            callID: initialCall.callID,
+            output: #"{"ok":false,"output":"The resolved task proposal was invalid, so no work started.","metadata":{"result_code":"proposal_invalid","validation_code":"invalid_type","validation_path":"$.parameters.goal","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .delegateRetry
+        )
+        harness.client.drainStateForVerification()
+
+        let retryCreates = harness.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any]
+            else { return false }
+            return metadata["aurora_continuation"] as? String
+                == "delegate_task_schema_retry_once"
+        }
+        guard retryCreates.count == 1,
+              let retryResponse = retryCreates[0]["response"] as? [String: Any],
+              let retryTools = retryResponse["tools"] as? [[String: Any]],
+              let retryChoice = retryResponse["tool_choice"] as? [String: Any]
+        else {
+            throw VerificationFailure.failed(
+                "an invalid delegate did not schedule exactly one private schema repair"
+            )
+        }
+        let retryInstructions = retryResponse["instructions"] as? String ?? ""
+        try expect(
+            retryTools.count == 1
+                && retryTools[0]["name"] as? String == "delegate_task"
+                && retryChoice["type"] as? String == "function"
+                && retryChoice["name"] as? String == "delegate_task"
+                && retryInstructions.contains("same finalized owner turn")
+                && retryInstructions.contains("Preserve the identical requested effect")
+                && retryInstructions.contains("emit no audio"),
+            "the delegate repair could speak, choose another tool, or widen the owner effect"
+        )
+
+        try deliver([
+            "type": "response.created",
+            "response": [
+                "id": "delegate_retry_corrected_response",
+                "status": "in_progress",
+            ],
+        ], harness: harness)
+        let correctedArguments = #"{"commitment":"execute","operation":"start","target_reference":"new_task","task_kind":"coding","execution_class":"project","parameters":{"goal":"Build the one-page demo without opening it.","success_criteria":null,"instruction":null,"workspace_path":null}}"#
+        try deliver(responseDone(
+            id: "delegate_retry_corrected_response",
+            status: "completed",
+            calls: [(
+                "delegate_retry_corrected_call",
+                "delegate_task",
+                correctedArguments
+            )]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard calls.count == 2 else {
+            throw VerificationFailure.failed(
+                "the corrected delegate proposal was not returned to host validation"
+            )
+        }
+        let correctedCall = calls[1]
+        try expect(
+            correctedCall.inputItemID == "delegate_retry_input"
+                && correctedCall.authorizationSource == .directOwnerTurn
+                && correctedCall.sourceTurnFinalized,
+            "the one structural retry lost finalized owner authorization provenance"
+        )
+
+        harness.client.submitFunctionResult(
+            connectionID: correctedCall.connectionID,
+            callID: correctedCall.callID,
+            output: #"{"ok":false,"output":"The resolved task proposal was invalid, so no work started.","metadata":{"result_code":"proposal_invalid","validation_code":"invalid_type","validation_path":"$.parameters.goal","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .delegateRetry
+        )
+        harness.client.drainStateForVerification()
+        let retriesAfterSecondFailure = harness.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any]
+            else { return false }
+            return metadata["aurora_continuation"] as? String
+                == "delegate_task_schema_retry_once"
+        }
+        try expect(
+            retriesAfterSecondFailure.count == 1
+                && diagnostics.contains("delegate_task_schema_retry_scheduled")
+                && diagnostics.contains("delegate_task_schema_retry_exhausted"),
+            "delegate schema repair was not bounded to one attempt"
+        )
+    }
+
+    /// Reproduces the failed-demo ordering where audio arrived before Realtime
+    /// announced its delegate_task item. The planning PCM must remain private;
+    /// only a host-accepted function result may create the one audible start
+    /// acknowledgement.
     private static func alreadyPlayingDelegateAcknowledgementIsNeverRepeated() throws {
         let tools = #"[{"type":"function","name":"delegate_task","description":"Resolved background work.","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":true}}]"#
         let harness = try makeHarness(toolsJSON: tools)
@@ -3626,7 +4329,7 @@ enum RealtimeVerification {
         var diagnostics: [String] = []
         harness.client.onFunctionCall = { calls.append($0) }
         harness.client.onDiagnostic = { _, kind, _ in diagnostics.append(kind) }
-        let proposalJSON = #"{"commitment":"execute","operation":"start","target_reference":"new_task","task_kind":"computer","parameters":{"goal":"Open YouTube."}}"#
+        let proposalJSON = #"{"commitment":"execute","operation":"start","target_reference":"new_task","task_kind":"computer","execution_class":"interactive","parameters":{"goal":"Open YouTube.","success_criteria":null,"instruction":null,"workspace_path":null}}"#
 
         try committedTurn(
             "already_spoken_delegate_input",
@@ -3634,8 +4337,8 @@ enum RealtimeVerification {
             harness: harness,
             transcript: "Open YouTube."
         )
-        // This is the production ordering from the duplicate-ack journal: the
-        // response begins speaking before the semantic tool item is announced.
+        // This is the production ordering from the failed-demo journal: the
+        // response emits PCM before the semantic tool item is announced.
         try deliver([
             "type": "response.output_audio_transcript.done",
             "response_id": "already_spoken_delegate_response",
@@ -3660,8 +4363,7 @@ enum RealtimeVerification {
                 "call_id": "already_spoken_delegate_call",
             ],
         ], harness: harness)
-        // The remaining audio must keep streaming after the late semantic item
-        // rather than leaving a chopped first acknowledgement.
+        // Later PCM from the same planning response remains held as well.
         try deliver([
             "type": "response.output_audio.delta",
             "response_id": "already_spoken_delegate_response",
@@ -3678,8 +4380,8 @@ enum RealtimeVerification {
         try expect(
             harness.audio.queuedKeys.filter {
                 $0.itemID == "already_spoken_delegate_audio"
-            }.count == 2,
-            "the late delegate item chopped its already-playing acknowledgement"
+            }.isEmpty,
+            "a task promise reached playback before host acceptance"
         )
         try deliver([
             "type": "response.done",
@@ -3711,13 +4413,11 @@ enum RealtimeVerification {
             )
         }
         try expect(
-            call.turnAlreadySpoke,
-            "the delegate proposal forgot audio that had already entered playback"
+            !call.turnAlreadySpoke,
+            "buffered pre-tool PCM was misreported as audible task acceptance"
         )
 
         let createsBeforeAcceptance = eventCount("response.create", socket: harness.socket)
-        // Deliberately submit the stale choice that previously escaped from the
-        // app. The transport owns final audible truth and must suppress it.
         harness.client.submitFunctionResult(
             connectionID: call.connectionID,
             callID: call.callID,
@@ -3727,11 +4427,12 @@ enum RealtimeVerification {
         harness.client.drainStateForVerification()
 
         try expect(
-            eventCount("response.create", socket: harness.socket) == createsBeforeAcceptance,
-            "delegate acceptance repeated an acknowledgement that was already playing"
+            eventCount("response.create", socket: harness.socket)
+                == createsBeforeAcceptance + 1,
+            "accepted delegate work did not create its one post-acceptance acknowledgement"
         )
         try expect(
-            !harness.socket.sentEvents().contains { event in
+            harness.socket.sentEvents().contains { event in
                 guard event["type"] as? String == "response.create",
                       let response = event["response"] as? [String: Any],
                       let metadata = response["metadata"] as? [String: Any]
@@ -3739,22 +4440,17 @@ enum RealtimeVerification {
                 return metadata["aurora_continuation"] as? String
                     == "delegate_task_started_once"
             },
-            "the already-spoken task turn created a synthetic start acknowledgement"
+            "the post-acceptance acknowledgement was not causally marked"
         )
         try expect(
-            diagnostics.contains(
-                "delegate_task_acknowledgement_suppressed_already_spoken"
-            ),
-            "the exactly-once delegate acknowledgement decision was not diagnosed"
-        )
-        try expect(
-            diagnostics.contains("delegate_task_audible_acknowledgement_retained")
-                && !harness.socket.sentEvents().contains { event in
+            diagnostics.contains("control_pretool_audio_discarded")
+                && !diagnostics.contains("delegate_task_audible_acknowledgement_retained")
+                && harness.socket.sentEvents().contains { event in
                     event["type"] as? String == "conversation.item.delete"
                         && event["item_id"] as? String
                             == "already_spoken_delegate_audio"
                 },
-            "Realtime history no longer matched the acknowledgement Aurora actually spoke"
+            "discarded pre-acceptance task speech remained in Realtime history"
         )
     }
 
@@ -3772,9 +4468,8 @@ enum RealtimeVerification {
             harness: harness,
             transcript: "Do you agree with me?"
         )
-        // Reproduce the same provider ordering as the live race: one audio
-        // packet crosses into playback before the semantic function item is
-        // announced, so that physical reply can no longer be retracted.
+        // Reproduce the same provider ordering as the live race. Planning PCM
+        // must remain buffered until the social decision is host-validated.
         try deliver([
             "type": "response.output_audio.delta",
             "response_id": "already_spoken_move_response",
@@ -3782,6 +4477,12 @@ enum RealtimeVerification {
             "content_index": 0,
             "delta": Data([0, 0]).base64EncodedString(),
         ], harness: harness)
+        try expect(
+            harness.audio.queuedKeys.filter {
+                $0.itemID == "already_spoken_move_audio"
+            }.isEmpty,
+            "conversation_move planning audio reached playback before validation"
+        )
         try deliver([
             "type": "response.output_item.added",
             "response_id": "already_spoken_move_response",
@@ -3810,35 +4511,33 @@ enum RealtimeVerification {
                 "the late conversation_move proposal was not dispatched"
             )
         }
-        try expect(call.turnAlreadySpoke,
-                   "conversation_move forgot audio already committed to playback")
+        try expect(!call.turnAlreadySpoke,
+                   "buffered conversation_move PCM was treated as already spoken")
         let responsesBeforeResult = eventCount("response.create", socket: harness.socket)
-        // Deliberately submit the stale continuation choice. ToolRegistry now
-        // chooses `.complete`, but transport remains the final exactly-once
-        // boundary if a callback raced with the audio packet.
         harness.client.submitFunctionResult(
             connectionID: call.connectionID,
             callID: call.callID,
-            output: #"{"ok":false,"error":"already spoke"}"#,
+            output: #"{"ok":true,"output":"validated"}"#,
             continuation: .conversationMove
         )
         harness.client.drainStateForVerification()
 
         try expect(eventCount("response.create", socket: harness.socket)
-                   == responsesBeforeResult,
-                   "a late conversation_move created a second audible response")
-        try expect(!harness.socket.sentEvents().contains { event in
+                   == responsesBeforeResult + 1,
+                   "validated conversation_move did not create its one audible response")
+        try expect(harness.socket.sentEvents().contains { event in
             guard event["type"] as? String == "response.create",
                   let response = event["response"] as? [String: Any],
                   let metadata = response["metadata"] as? [String: Any] else { return false }
             return metadata["aurora_continuation"] as? String
                 == "conversation_move_once"
-        }, "the already-spoken social turn scheduled a synthetic second reply")
+        }, "the host-validated social turn did not schedule its reply")
         try expect(
-            diagnostics.contains(
-                "conversation_move_continuation_suppressed_already_spoken"
-            ),
-            "the exactly-once social response suppression was not diagnosed"
+            diagnostics.contains("control_pretool_audio_discarded")
+                && !diagnostics.contains(
+                    "conversation_move_continuation_suppressed_already_spoken"
+                ),
+            "the pre-validation social audio was not discarded cleanly"
         )
     }
 
@@ -3991,12 +4690,12 @@ enum RealtimeVerification {
                    "unexposed legacy rejection was not diagnosed")
     }
 
-    private static func unavailableTranscriptAllowsStrictIntentProposal() throws {
-        let tools = #"[{"type":"function","name":"intent_proposal","description":"Resolved intent.","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":true}}]"#
+    private static func unavailableTranscriptAllowsStrictDelegateProposal() throws {
+        let tools = #"[{"type":"function","name":"delegate_task","description":"Resolved external work.","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":true}}]"#
         let harness = try makeHarness(toolsJSON: tools)
         var calls: [RealtimeFunctionCall] = []
         harness.client.onFunctionCall = { calls.append($0) }
-        let arguments = #"{"commitment":"execute","operation":"notes.create","target_reference":"new_note","parameters":{}}"#
+        let arguments = #"{"commitment":"execute","operation":"start","target_reference":"new_task","task_kind":"computer","execution_class":"interactive","parameters":{"goal":"Create a new Apple Note.","success_criteria":null,"instruction":null,"workspace_path":null}}"#
         try committedTurn(
             "intent_no_transcript_input",
             responseID: "intent_no_transcript_response",
@@ -4013,29 +4712,29 @@ enum RealtimeVerification {
             "item": [
                 "id": "intent_no_transcript_function_item",
                 "type": "function_call",
-                "name": "intent_proposal",
+                "name": "delegate_task",
                 "call_id": "intent_no_transcript_call",
             ],
         ], harness: harness)
         try deliver(responseDone(
             id: "intent_no_transcript_response",
             status: "completed",
-            calls: [("intent_no_transcript_call", "intent_proposal", arguments)]
+            calls: [("intent_no_transcript_call", "delegate_task", arguments)]
         ), harness: harness)
         harness.callbackQueue.sync {}
 
         try expect(calls.count == 1
-                   && calls[0].name == "intent_proposal"
+                   && calls[0].name == "delegate_task"
                    && calls[0].argumentsJSON == arguments
                    && calls[0].inputItemID == "intent_no_transcript_input"
                    && !calls[0].audioCorroborated,
-                   "a schema-valid audio-bound intent was lost when optional transcription failed")
+                   "a schema-valid audio-bound delegate was lost when optional transcription failed")
         try expect(!harness.socket.sentEvents().contains { event in
             guard event["type"] as? String == "response.create",
                   let response = event["response"] as? [String: Any],
                   let metadata = response["metadata"] as? [String: Any] else { return false }
             return metadata["aurora_purpose"] as? String == "audio_native_corroboration"
-        }, "a strict intent proposal was unnecessarily reinterpreted by an audio classifier")
+        }, "a strict delegate proposal was unnecessarily reinterpreted by an audio classifier")
     }
 
     private static func unavailableTranscriptAllowsOneBoundedMotorCall() throws {
@@ -5037,15 +5736,18 @@ enum RealtimeVerification {
     }
 
     private static func rateLimitRecoveryWaitsForReset() throws {
-        let harness = try makeHarness(toolsJSON: "[]")
+        let tools = #"[{"type":"function","name":"conversation_move","description":"Resolve a social turn.","parameters":{"type":"object","properties":{},"additionalProperties":true}}]"#
+        let harness = try makeHarness(toolsJSON: tools)
         var phases: [AuroraPhase] = []
         var addressedInputs: [String] = []
         var unresolvedInputs: [String] = []
         var diagnosticKinds: [String] = []
+        var calls: [RealtimeFunctionCall] = []
         harness.client.onPhase = { _, phase in phases.append(phase) }
         harness.client.onAddressedTurn = { _, inputItemID in addressedInputs.append(inputItemID) }
         harness.client.onUnresolvedTurn = { _, inputItemID in unresolvedInputs.append(inputItemID) }
         harness.client.onDiagnostic = { _, kind, _ in diagnosticKinds.append(kind) }
+        harness.client.onFunctionCall = { calls.append($0) }
 
         try committedTurn("user_rate_limited", responseID: "resp_rate_limited", harness: harness)
         try deliver(rateLimitsUpdated(
@@ -5109,19 +5811,43 @@ enum RealtimeVerification {
                    "rate-limit retry was not distinguishable in diagnostics")
         try expect(recovery["max_output_tokens"] as? Int == AuroraRealtimeClient.maxResponseOutputTokens,
                    "rate-limit retry restored an unbounded output reservation")
+        try expect(recovery["tool_choice"] as? String == "required",
+                   "rate-limit retry could bypass the semantic decision boundary")
 
         try deliver([
             "type": "response.created",
             "response": ["id": "resp_rate_recovered", "status": "in_progress"],
         ], harness: harness)
+        try deliver(responseDone(
+            id: "resp_rate_recovered",
+            status: "completed",
+            calls: [("call_rate_recovered", "conversation_move", "{}")]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard let recoveredCall = calls.last else {
+            throw VerificationFailure.failed(
+                "delayed rate-limit recovery did not reach its semantic decision"
+            )
+        }
+        harness.client.submitFunctionResult(
+            connectionID: recoveredCall.connectionID,
+            callID: recoveredCall.callID,
+            output: #"{"ok":true,"output":"validated"}"#,
+            continuation: .conversationMove
+        )
+        harness.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "resp_rate_recovered_spoken", "status": "in_progress"],
+        ], harness: harness)
         try assistantAudio(
-            responseID: "resp_rate_recovered",
+            responseID: "resp_rate_recovered_spoken",
             itemID: "assistant_rate_recovered",
             transcript: "I heard you.",
             harness: harness
         )
         try deliver(responseDone(
-            id: "resp_rate_recovered",
+            id: "resp_rate_recovered_spoken",
             status: "completed",
             calls: []
         ), harness: harness)
@@ -5142,7 +5868,12 @@ enum RealtimeVerification {
             diagnostics.append((kind, metadata))
         }
 
-        try committedTurn("usage_seed_input", responseID: "usage_seed_response", harness: harness)
+        // Seed usage from a proactive, tool-disabled-style response so this
+        // fixture measures token forecasting rather than owner-turn semantics.
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "usage_seed_response", "status": "in_progress"],
+        ], harness: harness)
         try assistantAudio(
             responseID: "usage_seed_response",
             itemID: "usage_seed_audio",
@@ -5315,8 +6046,10 @@ enum RealtimeVerification {
         let harness = try makeHarness()
         var phases: [AuroraPhase] = []
         var addressedInputs: [String] = []
+        var calls: [RealtimeFunctionCall] = []
         harness.client.onPhase = { _, phase in phases.append(phase) }
         harness.client.onAddressedTurn = { _, inputItemID in addressedInputs.append(inputItemID) }
+        harness.client.onFunctionCall = { calls.append($0) }
         try deliver([
             "type": "input_audio_buffer.committed",
             "item_id": "user_top_level_limit",
@@ -5350,17 +6083,34 @@ enum RealtimeVerification {
             "type": "response.created",
             "response": ["id": "resp_top_level_recovered", "status": "in_progress"],
         ], harness: harness)
+        try deliver(responseDone(
+            id: "resp_top_level_recovered",
+            status: "completed",
+            calls: [("call_top_level_recovered", "conversation_move", "{}")]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard let recoveredCall = calls.last else {
+            throw VerificationFailure.failed(
+                "top-level rate-limit recovery did not reach a semantic decision"
+            )
+        }
+        harness.client.submitFunctionResult(
+            connectionID: recoveredCall.connectionID,
+            callID: recoveredCall.callID,
+            output: #"{"ok":true,"output":"validated"}"#,
+            continuation: .conversationMove
+        )
+        harness.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "resp_top_level_recovered_spoken", "status": "in_progress"],
+        ], harness: harness)
         try assistantAudio(
-            responseID: "resp_top_level_recovered",
+            responseID: "resp_top_level_recovered_spoken",
             itemID: "assistant_top_level_recovered",
             transcript: "I heard you.",
             harness: harness
         )
-        try deliver(responseDone(
-            id: "resp_top_level_recovered",
-            status: "completed",
-            calls: []
-        ), harness: harness)
         try expect(addressedInputs == ["user_top_level_limit"],
                    "top-level rate-limit recovery lost its committed input origin")
 
@@ -5482,11 +6232,13 @@ enum RealtimeVerification {
         var exhaustedInputs: [String] = []
         var exhaustedAddressedInputs: [String] = []
         var exhaustedPhases: [AuroraPhase] = []
+        var exhaustedCalls: [RealtimeFunctionCall] = []
         exhausted.client.onUnresolvedTurn = { _, inputItemID in exhaustedInputs.append(inputItemID) }
         exhausted.client.onAddressedTurn = { _, inputItemID in
             exhaustedAddressedInputs.append(inputItemID)
         }
         exhausted.client.onPhase = { _, phase in exhaustedPhases.append(phase) }
+        exhausted.client.onFunctionCall = { exhaustedCalls.append($0) }
         try committedTurn("user_rate_twice", responseID: "resp_rate_one", harness: exhausted)
         try deliver(rateLimitsUpdated(
             requestsRemaining: 0,
@@ -5527,17 +6279,34 @@ enum RealtimeVerification {
             responseID: "resp_after_rate_exhaustion",
             harness: exhausted
         )
+        try deliver(responseDone(
+            id: "resp_after_rate_exhaustion",
+            status: "completed",
+            calls: [("call_after_rate_exhaustion", "conversation_move", "{}")]
+        ), harness: exhausted)
+        exhausted.callbackQueue.sync {}
+        guard let afterExhaustionCall = exhaustedCalls.last else {
+            throw VerificationFailure.failed(
+                "the live turn after rate-limit exhaustion had no semantic decision"
+            )
+        }
+        exhausted.client.submitFunctionResult(
+            connectionID: afterExhaustionCall.connectionID,
+            callID: afterExhaustionCall.callID,
+            output: #"{"ok":true,"output":"validated"}"#,
+            continuation: .conversationMove
+        )
+        exhausted.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "resp_after_rate_exhaustion_spoken", "status": "in_progress"],
+        ], harness: exhausted)
         try assistantAudio(
-            responseID: "resp_after_rate_exhaustion",
+            responseID: "resp_after_rate_exhaustion_spoken",
             itemID: "assistant_after_rate_exhaustion",
             transcript: "I am still here.",
             harness: exhausted
         )
-        try deliver(responseDone(
-            id: "resp_after_rate_exhaustion",
-            status: "completed",
-            calls: []
-        ), harness: exhausted)
         try expect(exhaustedInputs == ["user_rate_twice"]
                    && exhaustedAddressedInputs == ["user_after_rate_exhaustion"],
                    "rate-limit exhaustion leaked the failed origin into the next live turn")
@@ -5636,7 +6405,13 @@ enum RealtimeVerification {
         let tail = try makeHarness()
         var tailCommits: [RealtimeInputCommitEvent] = []
         tail.client.onInputCommitted = { tailCommits.append($0) }
-        try committedTurn("tail-source", responseID: "tail-response", harness: tail)
+        // Playback-boundary evidence is transport bookkeeping, independent of
+        // the owner-turn semantic gate. Use an unbound proactive response so
+        // this fixture exercises audible playback rather than pre-tool PCM.
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "tail-response", "status": "in_progress"],
+        ], harness: tail)
         try assistantAudio(
             responseID: "tail-response",
             itemID: "tail-assistant",
@@ -5677,11 +6452,10 @@ enum RealtimeVerification {
         let interruption = try makeHarness()
         var interruptionCommits: [RealtimeInputCommitEvent] = []
         interruption.client.onInputCommitted = { interruptionCommits.append($0) }
-        try committedTurn(
-            "interruption-source",
-            responseID: "interruption-response",
-            harness: interruption
-        )
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "interruption-response", "status": "in_progress"],
+        ], harness: interruption)
         try assistantAudio(
             responseID: "interruption-response",
             itemID: "interruption-assistant",
@@ -5746,29 +6520,54 @@ enum RealtimeVerification {
     private static func assistantEmptyTranscriptStillCompletesPlayback() throws {
         let transcriptFirst = try makeHarness()
         var transcriptFirstOutcomes: [RealtimeAssistantPlaybackOutcome] = []
+        var transcriptFirstCalls: [RealtimeFunctionCall] = []
         transcriptFirst.client.onAssistantPlaybackOutcome = { transcriptFirstOutcomes.append($0) }
+        transcriptFirst.client.onFunctionCall = { transcriptFirstCalls.append($0) }
         try committedTurn(
             "assistant-empty-transcript-first-user",
             responseID: "assistant-empty-transcript-first-response",
             harness: transcriptFirst
         )
+        try deliver(responseDone(
+            id: "assistant-empty-transcript-first-response",
+            status: "completed",
+            calls: [("assistant-empty-transcript-first-call", "conversation_move", "{}")]
+        ), harness: transcriptFirst)
+        transcriptFirst.callbackQueue.sync {}
+        guard let transcriptFirstCall = transcriptFirstCalls.last else {
+            throw VerificationFailure.failed("empty-transcript fixture lacked a semantic decision")
+        }
+        transcriptFirst.client.submitFunctionResult(
+            connectionID: transcriptFirstCall.connectionID,
+            callID: transcriptFirstCall.callID,
+            output: #"{"ok":true,"output":"validated"}"#,
+            continuation: .conversationMove
+        )
+        transcriptFirst.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": [
+                "id": "assistant-empty-transcript-first-spoken-response",
+                "status": "in_progress",
+            ],
+        ], harness: transcriptFirst)
         try deliver([
             "type": "response.output_audio_transcript.done",
-            "response_id": "assistant-empty-transcript-first-response",
+            "response_id": "assistant-empty-transcript-first-spoken-response",
             "item_id": "assistant-empty-transcript-first-item",
             "content_index": 0,
             "transcript": "",
         ], harness: transcriptFirst)
         try deliver([
             "type": "response.output_audio.delta",
-            "response_id": "assistant-empty-transcript-first-response",
+            "response_id": "assistant-empty-transcript-first-spoken-response",
             "item_id": "assistant-empty-transcript-first-item",
             "content_index": 0,
             "delta": Data([0, 0, 0, 0]).base64EncodedString(),
         ], harness: transcriptFirst)
         try deliver([
             "type": "response.output_audio.done",
-            "response_id": "assistant-empty-transcript-first-response",
+            "response_id": "assistant-empty-transcript-first-spoken-response",
             "item_id": "assistant-empty-transcript-first-item",
             "content_index": 0,
         ], harness: transcriptFirst)
@@ -5787,22 +6586,47 @@ enum RealtimeVerification {
 
         let playbackFirst = try makeHarness()
         var playbackFirstOutcomes: [RealtimeAssistantPlaybackOutcome] = []
+        var playbackFirstCalls: [RealtimeFunctionCall] = []
         playbackFirst.client.onAssistantPlaybackOutcome = { playbackFirstOutcomes.append($0) }
+        playbackFirst.client.onFunctionCall = { playbackFirstCalls.append($0) }
         try committedTurn(
             "assistant-empty-playback-first-user",
             responseID: "assistant-empty-playback-first-response",
             harness: playbackFirst
         )
+        try deliver(responseDone(
+            id: "assistant-empty-playback-first-response",
+            status: "completed",
+            calls: [("assistant-empty-playback-first-call", "conversation_move", "{}")]
+        ), harness: playbackFirst)
+        playbackFirst.callbackQueue.sync {}
+        guard let playbackFirstCall = playbackFirstCalls.last else {
+            throw VerificationFailure.failed("playback-first fixture lacked a semantic decision")
+        }
+        playbackFirst.client.submitFunctionResult(
+            connectionID: playbackFirstCall.connectionID,
+            callID: playbackFirstCall.callID,
+            output: #"{"ok":true,"output":"validated"}"#,
+            continuation: .conversationMove
+        )
+        playbackFirst.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": [
+                "id": "assistant-empty-playback-first-spoken-response",
+                "status": "in_progress",
+            ],
+        ], harness: playbackFirst)
         try deliver([
             "type": "response.output_audio.delta",
-            "response_id": "assistant-empty-playback-first-response",
+            "response_id": "assistant-empty-playback-first-spoken-response",
             "item_id": "assistant-empty-playback-first-item",
             "content_index": 0,
             "delta": Data([0, 0, 0, 0]).base64EncodedString(),
         ], harness: playbackFirst)
         try deliver([
             "type": "response.output_audio.done",
-            "response_id": "assistant-empty-playback-first-response",
+            "response_id": "assistant-empty-playback-first-spoken-response",
             "item_id": "assistant-empty-playback-first-item",
             "content_index": 0,
         ], harness: playbackFirst)
@@ -5815,7 +6639,7 @@ enum RealtimeVerification {
                    "playback completed before transcript finalization was known")
         try deliver([
             "type": "response.output_audio_transcript.done",
-            "response_id": "assistant-empty-playback-first-response",
+            "response_id": "assistant-empty-playback-first-spoken-response",
             "item_id": "assistant-empty-playback-first-item",
             "content_index": 0,
             "transcript": "",
@@ -5884,12 +6708,15 @@ enum RealtimeVerification {
 
     private static func overlappingPlaybackTruncatesWhatWasHeard() throws {
         let harness = try makeHarness()
-        var calls: [RealtimeFunctionCall] = []
         var outcomes: [RealtimeAssistantPlaybackOutcome] = []
-        harness.client.onFunctionCall = { calls.append($0) }
         harness.client.onAssistantPlaybackOutcome = { outcomes.append($0) }
 
-        try committedTurn("user_overlap", responseID: "resp_preamble", harness: harness)
+        // Playback overlap is transport bookkeeping. Use proactive responses
+        // so no owner-turn planning audio bypasses the semantic gate.
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "resp_preamble", "status": "in_progress"],
+        ], harness: harness)
         try assistantAudio(
             responseID: "resp_preamble",
             itemID: "item_preamble",
@@ -5899,17 +6726,8 @@ enum RealtimeVerification {
         try deliver(responseDone(
             id: "resp_preamble",
             status: "completed",
-            calls: [("lookup", "memory_search", #"{"query":"promise"}"#)]
+            calls: []
         ), harness: harness)
-        guard let call = calls.first else {
-            throw VerificationFailure.failed("preamble tool call was not dispatched")
-        }
-        harness.client.submitFunctionResult(
-            connectionID: call.connectionID,
-            callID: call.callID,
-            output: #"{"ok":true}"#
-        )
-        harness.client.drainStateForVerification()
 
         try deliver([
             "type": "response.created",
@@ -6275,6 +7093,10 @@ enum RealtimeFocusedVerifier {
             "AURORA_VERIFY_INPUT_COMMIT_EVIDENCE_ONLY"
         ] == "1" {
             checks = try RealtimeVerification.runInputCommitEvidence()
+        } else if ProcessInfo.processInfo.environment[
+            "AURORA_VERIFY_PROJECT_CHAT_ONLY"
+        ] == "1" {
+            checks = try RealtimeVerification.runProjectChatRouting()
         } else if ProcessInfo.processInfo.environment[
             "AURORA_VERIFY_CAUSAL_CONTINUATIONS_ONLY"
         ] == "1" {

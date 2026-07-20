@@ -40,8 +40,10 @@ import Foundation
 
 /// Aurora's production tool boundary.
 ///
-/// External work has exactly one route: `delegate_task`, which creates or
-/// continues a persistent Codex task. The remaining functions are bounded
+/// Ordinary external work has one route: `delegate_task`, which creates or
+/// continues a persistent Codex task. `codex_project_chat` is a separate,
+/// explicit navigation/relay route for a user-selected existing Codex chat.
+/// The remaining functions are bounded
 /// internal continuity and turn-taking operations; none can control macOS,
 /// call the Responses API, browse, send mail, or mutate an external service.
 public actor ToolRegistry {
@@ -66,11 +68,16 @@ public actor ToolRegistry {
 
     public static let realtimeFunctionSchemas: [RealtimeFunctionSchema] = [
         DelegateTaskProposal.realtimeFunctionSchema,
+        CodexProjectChatProposal.realtimeFunctionSchema,
         RealtimeFunctionSchema(
             name: "conversation_move",
-            description: "Required before every ordinary social reply. Resolve what the person actually did in this turn, propose one authored conversational move, optionally revise Aurora's grounded point of view, and capture meaningful owner learning. Do not speak before this function. For external work use delegate_task instead; for unmistakable background audio use wait_for_user.",
+            description: "Required before every ordinary social reply and never valid for an external action or named Codex project/chat request. Truthfully classify turn_domain even when that makes this function the wrong route. A desire to work in, open, select, inspect, continue, or message a named Codex project/chat uses codex_project_chat even before the owner supplies the eventual work message. Other external work uses delegate_task; unmistakable background audio uses wait_for_user. Do not speak before the correct function.",
             parameters: objectSchema(
                 properties: [
+                    "turn_domain": enumStringSchema(
+                        "Truthful semantic domain of the finalized owner turn, independent of the function currently being called. social is ordinary conversation; delegated_action is external work; codex_project_chat is any navigation, status, selection, or relay involving a named Codex project or chat.",
+                        values: ConversationTurnDomain.allCases.map(\.rawValue)
+                    ),
                     "perceived_turn": enumStringSchema(
                         "The conversational act heard in the current audio, not a phrase match.",
                         values: [
@@ -196,7 +203,7 @@ public actor ToolRegistry {
                     ),
                 ],
                 required: [
-                    "perceived_turn", "interaction_kind", "proposed_move",
+                    "turn_domain", "perceived_turn", "interaction_kind", "proposed_move",
                     "answer_degree", "aurora_first_person_position", "private_rationale", "record_ids",
                     "record_updates", "understanding_updates",
                 ]
@@ -333,6 +340,19 @@ public actor ToolRegistry {
         result: ToolExecutionResult,
         turnAlreadySpoke: Bool = false
     ) -> RealtimeToolContinuation {
+        if toolName == "conversation_move",
+           result.metadata["result_code"]?.stringValue
+            == "conversation_move_route_mismatch",
+           let retryTool = result.metadata["semantic_retry_tool"]?.stringValue,
+           retryTool == "delegate_task" || retryTool == "codex_project_chat" {
+            return turnAlreadySpoke
+                ? .complete
+                : .semanticRouteRetry(toolName: retryTool)
+        }
+        if toolName == "conversation_move",
+           result.metadata["result_code"]?.stringValue == "proposal_invalid" {
+            return turnAlreadySpoke ? .complete : .delegateRetry
+        }
         if toolName == "conversation_move" {
             // The result is private conversational direction, never a task
             // receipt. If audio from the planning response already crossed
@@ -361,6 +381,9 @@ public actor ToolRegistry {
         if toolName == "delegate_task" {
             let resultCode = result.metadata["result_code"]?.stringValue
             let taskStillRunning = result.metadata["background_task"]?.boolValue == true
+            if resultCode == "proposal_invalid" {
+                return turnAlreadySpoke ? .complete : .delegateRetry
+            }
             if result.ok,
                resultCode == DelegateTaskCoordinatorResultCode.accepted.rawValue
                 || (resultCode == DelegateTaskCoordinatorResultCode.updated.rawValue
@@ -368,6 +391,23 @@ public actor ToolRegistry {
                 return turnAlreadySpoke ? .complete : .delegateAccepted
             }
             return .speak
+        }
+        if toolName == "codex_project_chat" {
+            let resultCode = result.metadata["result_code"]?.stringValue
+            let taskStillRunning = result.metadata["background_task"]?.boolValue == true
+            if resultCode == "proposal_invalid" {
+                return turnAlreadySpoke ? .complete : .delegateRetry
+            }
+            if result.ok,
+               resultCode == CodexProjectChatResultCode.accepted.rawValue,
+               taskStillRunning {
+                return turnAlreadySpoke ? .complete : .delegateAccepted
+            }
+            if result.ok,
+               resultCode == CodexProjectChatResultCode.accepted.rawValue {
+                return .complete
+            }
+            return turnAlreadySpoke ? .complete : .speak
         }
         guard result.ok else { return .speak }
         if turnAlreadySpoke,
@@ -523,6 +563,8 @@ public actor ToolRegistry {
             switch name {
             case "delegate_task":
                 result = await executeDelegateTask(arguments: arguments, context: context)
+            case "codex_project_chat":
+                result = await executeCodexProjectChat(arguments: arguments, context: context)
             case "conversation_move":
                 guard let conversationMoveHandler else {
                     throw ToolRegistryError.unknownTool
@@ -594,12 +636,26 @@ public actor ToolRegistry {
         let proposal: DelegateTaskProposal
         do {
             proposal = try DelegateTaskProposal(arguments: arguments)
+        } catch let validationError as DelegateTaskProposalValidationError {
+            return ToolExecutionResult(
+                ok: false,
+                output: "The resolved task proposal was invalid, so no work started.",
+                metadata: [
+                    "result_code": .string("proposal_invalid"),
+                    "validation_code": .string(validationError.diagnosticCode),
+                    "validation_path": .string(validationError.diagnosticPath),
+                    "effect_verified": .bool(false),
+                    "external_side_effect": .bool(false),
+                ]
+            )
         } catch {
             return ToolExecutionResult(
                 ok: false,
                 output: "The resolved task proposal was invalid, so no work started.",
                 metadata: [
                     "result_code": .string("proposal_invalid"),
+                    "validation_code": .string("unknown_validation_error"),
+                    "validation_path": .string("$"),
                     "effect_verified": .bool(false),
                     "external_side_effect": .bool(false),
                 ]
@@ -679,19 +735,127 @@ public actor ToolRegistry {
         )
     }
 
+    private func executeCodexProjectChat(
+        arguments: [String: ToolJSONValue],
+        context: ToolInvocationContext
+    ) async -> ToolExecutionResult {
+        let proposal: CodexProjectChatProposal
+        do {
+            proposal = try CodexProjectChatProposal(arguments: arguments)
+        } catch let validationError as DelegateTaskProposalValidationError {
+            return ToolExecutionResult(
+                ok: false,
+                output: "That Codex project/chat request was incomplete, so nothing changed.",
+                metadata: [
+                    "result_code": .string("proposal_invalid"),
+                    "validation_code": .string(validationError.diagnosticCode),
+                    "validation_path": .string(validationError.diagnosticPath),
+                    "effect_verified": .bool(false),
+                    "external_side_effect": .bool(false),
+                ]
+            )
+        } catch {
+            return ToolExecutionResult(
+                ok: false,
+                output: "That Codex project/chat request was incomplete, so nothing changed.",
+                metadata: [
+                    "result_code": .string("proposal_invalid"),
+                    "effect_verified": .bool(false),
+                    "external_side_effect": .bool(false),
+                ]
+            )
+        }
+
+        let relayText: String?
+        switch proposal.operation {
+        case .relay:
+            relayText = context.latestUserTranscript
+        case .relayToChat:
+            relayText = proposal.message
+        default:
+            relayText = nil
+        }
+        let resolvedTarget: CodexProjectChatResolvedTarget
+        switch await delegateTaskCoordinator.prepareProjectChatAuthorization(
+            proposal: proposal
+        ) {
+        case .ready(let target):
+            resolvedTarget = target
+        case .failed(let failure):
+            return ToolExecutionResult(
+                ok: false,
+                output: failure.detail,
+                metadata: [
+                    "result_code": .string(failure.code.rawValue),
+                    "authorization_decision": .string("not_evaluated"),
+                    "operation": .string(proposal.operation.rawValue),
+                    "effect_verified": .bool(false),
+                    "external_side_effect": .bool(false),
+                ]
+            )
+        }
+        let decision = CodexProjectChatAuthorizationFactory.issue(
+            proposal: proposal,
+            relayText: relayText,
+            resolvedTarget: resolvedTarget,
+            sourceTranscript: context.latestUserTranscript,
+            context: context
+        )
+        let authorization: CodexProjectChatAuthorizationEnvelope
+        switch decision {
+        case .success(let envelope):
+            authorization = envelope
+        case .failure(let reason):
+            return ToolExecutionResult(
+                ok: false,
+                output: Self.delegateAuthorizationFailureText(reason),
+                metadata: [
+                    "result_code": .string(reason.rawValue),
+                    "authorization_decision": .string("denied"),
+                    "operation": .string(proposal.operation.rawValue),
+                    "effect_verified": .bool(false),
+                    "external_side_effect": .bool(false),
+                ]
+            )
+        }
+
+        let coordinated = await delegateTaskCoordinator.projectChat(
+            proposal: proposal,
+            authorization: authorization
+        )
+        var metadata: [String: ToolJSONValue] = [
+            "result_code": .string(coordinated.code.rawValue),
+            "authorization_id": .string(authorization.authorizationID),
+            "authorization_decision": .string("authorized"),
+            "operation": .string(proposal.operation.rawValue),
+            "background_task": .bool(coordinated.backgroundTask),
+            "effect_verified": .bool(false),
+            "external_side_effect": .bool(coordinated.code == .accepted),
+        ]
+        if let threadID = coordinated.threadID {
+            metadata["codex_thread_id"] = .string(threadID)
+        }
+        if let taskID = coordinated.taskID {
+            metadata["task_id"] = .string(taskID)
+        }
+        return ToolExecutionResult(
+            ok: coordinated.ok,
+            output: coordinated.detail,
+            metadata: metadata
+        )
+    }
+
     private func conversationMoveProposal(
         arguments: [String: ToolJSONValue],
         context: ToolInvocationContext
     ) throws -> ConversationMoveToolProposal {
         let requiredFields: Set<String> = [
-            "perceived_turn", "interaction_kind", "proposed_move",
+            "turn_domain", "perceived_turn", "interaction_kind", "proposed_move",
             "answer_degree", "aurora_first_person_position", "private_rationale", "record_ids",
             "record_updates", "understanding_updates",
         ]
         let allowedFields = requiredFields.union(["disclosure_record_id"])
-        guard requiredFields.isSubset(of: Set(arguments.keys)),
-              Set(arguments.keys).isSubset(of: allowedFields),
-              context.hasTrustedCurrentAudio,
+        guard context.hasTrustedCurrentAudio,
               context.sourceTurnFinalized,
               (context.authorizationSource == .directOwnerTurn
                 || context.authorizationSource == .toolContinuation),
@@ -699,7 +863,16 @@ public actor ToolRegistry {
               context.latestUserTranscript?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
             throw ToolRegistryError.ownerRequestUnavailable
         }
+        guard requiredFields.isSubset(of: Set(arguments.keys)),
+              Set(arguments.keys).isSubset(of: allowedFields) else {
+            throw ToolRegistryError.invalidArgument("conversation_move")
+        }
 
+        guard let turnDomain = ConversationTurnDomain(rawValue: try requiredString(
+            "turn_domain", in: arguments, maximumCharacters: 48
+        )) else {
+            throw ToolRegistryError.invalidArgument("conversation_move")
+        }
         let perceivedTurn = try requiredString(
             "perceived_turn", in: arguments, maximumCharacters: 48
         )
@@ -797,6 +970,7 @@ public actor ToolRegistry {
         }
 
         return ConversationMoveToolProposal(
+            turnDomain: turnDomain,
             perceivedTurn: perceivedTurn,
             interactionKind: interactionKind,
             proposedMove: proposedMove,
@@ -1666,7 +1840,21 @@ public actor ToolRegistry {
 
     private func invalidResult(name: String, error: Error) -> ToolExecutionResult {
         let metadata: [String: ToolJSONValue]
-        if name == "delegate_task" {
+        let conversationProposalInvalid: Bool
+        if name == "conversation_move",
+           let registryError = error as? ToolRegistryError {
+            switch registryError {
+            case .malformedArguments, .missingArgument, .invalidArgument:
+                conversationProposalInvalid = true
+            default:
+                conversationProposalInvalid = false
+            }
+        } else {
+            conversationProposalInvalid = false
+        }
+        if name == "delegate_task"
+            || name == "codex_project_chat"
+            || conversationProposalInvalid {
             metadata = [
                 "result_code": .string("proposal_invalid"),
                 "effect_verified": .bool(false),
