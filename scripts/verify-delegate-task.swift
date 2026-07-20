@@ -19,6 +19,8 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
     case requestTimedOut(method: String)
     case requestCancelled
     case chatGPTLoginRequired
+    case projectMessagePreparationFailed
+    case serverError(code: Int, message: String)
 
     var errorDescription: String? {
         switch self {
@@ -31,6 +33,9 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
         case .requestTimedOut: return "The verification runtime request timed out."
         case .requestCancelled: return "The verification runtime request was cancelled."
         case .chatGPTLoginRequired: return "Codex must be signed in with ChatGPT."
+        case .projectMessagePreparationFailed:
+            return "The project message failed before submission."
+        case .serverError(_, let message): return message
         }
     }
 }
@@ -310,6 +315,7 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
     private var detachedTaskPersistenceError: CodexTaskRuntimeError?
     private var projectThreads: [AuroraCodexThreadSummary] = []
     private var exactMessages: [ExactMessageRecord] = []
+    private var exactMessageError: CodexTaskRuntimeError?
     private var projectTaskIDByThreadID: [String: String] = [:]
 
     func setEventHandler(
@@ -377,6 +383,7 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
         input: String,
         expectedWorkingDirectory: URL
     ) async throws -> CodexTaskHandle {
+        if let exactMessageError { throw exactMessageError }
         guard let thread = projectThreads.first(where: { $0.threadID == threadID }),
               thread.workingDirectory.standardizedFileURL.path
                 == expectedWorkingDirectory.standardizedFileURL.path else {
@@ -415,6 +422,10 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
     }
 
     func exactMessageRecords() -> [ExactMessageRecord] { exactMessages }
+
+    func setExactMessageError(_ error: CodexTaskRuntimeError?) {
+        exactMessageError = error
+    }
 
     func steerTask(taskID: String, input: String) async throws {
         guard activeTaskIDs.contains(taskID) else {
@@ -3549,6 +3560,61 @@ private struct DelegateTaskVerification {
             duplicateRelay.code == .duplicate
                 && duplicateRecordCount == 1,
             "a redelivered project-chat call sent the same owner message twice"
+        )
+
+        let unavailableSpeech = "This message should exercise a local bridge failure."
+        let unavailableAuthorization = try projectAuthorization(
+            relay,
+            relayText: unavailableSpeech,
+            resolvedTarget: try await projectTarget(coordinator!, relay),
+            callID: "unavailable-project-relay-call",
+            turnID: "unavailable-project-relay-turn",
+            transcript: unavailableSpeech
+        )
+        await runtime.setExactMessageError(.projectMessagePreparationFailed)
+        let unavailableRelay = await coordinator!.projectChat(
+            proposal: relay,
+            authorization: unavailableAuthorization
+        )
+        await runtime.setExactMessageError(nil)
+        let unavailableRecordCount = await runtime.exactMessageRecords().count
+        try expect(
+            unavailableRelay.code == .executionFailed
+                && unavailableRelay.detail.contains("could not be reached")
+                && !unavailableRelay.detail.localizedCaseInsensitiveContains("rejected")
+                && unavailableRecordCount == 1,
+            "a local project-chat bridge failure was falsely reported as a Codex rejection"
+        )
+
+        let rejectedSpeech = "This message should exercise an explicit server rejection."
+        let rejectedAuthorization = try projectAuthorization(
+            relay,
+            relayText: rejectedSpeech,
+            resolvedTarget: try await projectTarget(coordinator!, relay),
+            callID: "rejected-project-relay-call",
+            turnID: "rejected-project-relay-turn",
+            transcript: rejectedSpeech
+        )
+        await runtime.setExactMessageError(.serverError(
+            code: -32_000,
+            message: "Verification rejection"
+        ))
+        let rejectedRelay = await coordinator!.projectChat(
+            proposal: relay,
+            authorization: rejectedAuthorization
+        )
+        await runtime.setExactMessageError(nil)
+        let persistedRejection = try store.load()?.records.first(where: {
+            $0.taskID == relayed.taskID
+        })
+        let rejectedRecordCount = await runtime.exactMessageRecords().count
+        try expect(
+            rejectedRelay.code == .executionFailed
+                && rejectedRelay.detail.localizedCaseInsensitiveContains("rejected")
+                && persistedRejection?.resultSummary
+                    == "Codex rejected the project-chat message."
+                && rejectedRecordCount == 1,
+            "an explicit Codex rejection lost its distinct spoken or durable truth"
         )
 
         let staleSpeech = "This stale message must never be sent."

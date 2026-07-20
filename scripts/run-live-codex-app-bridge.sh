@@ -16,5 +16,6 @@ swiftc \
   -o "$OUT"
 
 # The verifier itself requires the same opt-in. It creates one read-only,
-# no-external-effect Codex turn, verifies visibility/recovery, and archives it.
+# no-external-effect Codex thread, reconnects, appends a second turn through the
+# selected-existing-chat path, verifies both, and archives the test thread.
 AURORA_VERIFY_LIVE_CODEX_APP_BRIDGE=1 "$OUT"

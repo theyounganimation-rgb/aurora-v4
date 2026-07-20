@@ -67,6 +67,8 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
     private var failsToStart: Bool
     private var threadReadResponses: [[String: Any]] = []
     private var threadListResponses: [[String: Any]] = []
+    private var threadTurnsListResponses: [[String: Any]] = []
+    private var simulatesOversizedHistoryOnIncludeTurns = false
     private var nextTurnStartError: [String: Any]?
     private var nextTurnSteerError: [String: Any]?
 
@@ -144,11 +146,39 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
         case "thread/read":
             let params = object["params"] as? [String: Any] ?? [:]
             let threadID = params["threadId"] as? String ?? "missing"
+            if simulatesOversizedHistoryOnIncludeTurns,
+               params["includeTurns"] as? Bool == true {
+                respond(id: id, result: [
+                    "thread": desktopThread(
+                        threadID: threadID,
+                        turns: [[
+                            "id": "turn-oversized-history",
+                            "status": "completed",
+                            "items": [[
+                                "id": "item-oversized-history",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": String(repeating: "x", count: 256 * 1_024),
+                            ]],
+                        ]]
+                    ),
+                ])
+                return
+            }
             let response = threadReadResponses.isEmpty
                 ? [
                     "thread": desktopThread(threadID: threadID, turns: []),
                 ]
                 : threadReadResponses.removeFirst()
+            respond(id: id, result: response)
+        case "thread/turns/list":
+            let response = threadTurnsListResponses.isEmpty
+                ? [
+                    "data": [],
+                    "nextCursor": NSNull(),
+                    "backwardsCursor": NSNull(),
+                ]
+                : threadTurnsListResponses.removeFirst()
             respond(id: id, result: response)
         case "thread/list":
             let response = threadListResponses.isEmpty
@@ -263,6 +293,14 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
 
     func setThreadListResponses(_ responses: [[String: Any]]) {
         threadListResponses = responses
+    }
+
+    func setThreadTurnsListResponses(_ responses: [[String: Any]]) {
+        threadTurnsListResponses = responses
+    }
+
+    func simulateOversizedHistoryOnIncludeTurns() {
+        simulatesOversizedHistoryOnIncludeTurns = true
     }
 
     func failNextTurnStart(code: Int = -32_000, message: String) {
@@ -386,7 +424,7 @@ private enum CodexTaskRuntimeVerifier {
             }
             let payload: [String: Any] = [
                 "ok": true,
-                "checks": 122,
+                "checks": 123,
                 "liveAccountHandshake": liveHandshakeRequested,
                 "liveSharedDaemonHandshake": liveSharedDaemonHandshake,
                 "realModelCalls": 0,
@@ -810,19 +848,18 @@ private enum CodexTaskRuntimeVerifier {
                 ),
             ]),
         ])
-        await existingTransport.setThreadReadResponses([
-            [
-                "thread": desktopThreadFixture(
-                    threadID: existingThreadID,
-                    cwd: projectDirectory.path,
-                    turns: [[
-                        "id": "turn-owner-complete",
-                        "status": "completed",
-                        "items": [],
-                    ]]
-                ),
-            ],
+        await existingTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-owner-complete",
+                "status": "completed",
+                "itemsView": "notLoaded",
+                "items": [],
+            ]]),
         ])
+        // A real owner-selected chat reached 281 MB. If this path regresses to
+        // thread/read(includeTurns: true), the fake returns a response larger
+        // than the verifier's 128 KiB inbound boundary and the send fails.
+        await existingTransport.simulateOversizedHistoryOnIncludeTurns()
         let existingRuntime = makeRuntime(transport: existingTransport)
         let existingHandle = try await existingRuntime.sendExactMessage(
             taskID: "project.owner-existing",
@@ -848,8 +885,9 @@ private enum CodexTaskRuntimeVerifier {
             throw VerificationFailure.failed("existing raw thread was not resumed and continued")
         }
         try expect(
-            Set(resumeParams.keys) == Set(["threadId"])
+            Set(resumeParams.keys) == Set(["threadId", "excludeTurns"])
                 && resumeParams["threadId"] as? String == existingThreadID
+                && resumeParams["excludeTurns"] as? Bool == true
                 && continuedInput.first?["text"] as? String == exactExistingText
                 && continuedParams["effort"] == nil
                 && continuedParams["outputSchema"] == nil,
@@ -857,13 +895,23 @@ private enum CodexTaskRuntimeVerifier {
         )
         let existingMethods = existingMessages.compactMap { $0["method"] as? String }
         guard let listIndex = existingMethods.firstIndex(of: "thread/list"),
-              let readIndex = existingMethods.firstIndex(of: "thread/read"),
+              let turnsIndex = existingMethods.firstIndex(of: "thread/turns/list"),
               let resumeIndex = existingMethods.firstIndex(of: "thread/resume"),
               let turnIndex = existingMethods.lastIndex(of: "turn/start") else {
             throw VerificationFailure.failed("raw existing-thread validation sequence was incomplete")
         }
+        guard let turnsRequest = existingMessages.first(where: {
+            $0["method"] as? String == "thread/turns/list"
+        }), let turnsParams = turnsRequest["params"] as? [String: Any] else {
+            throw VerificationFailure.failed("bounded latest-turn lookup was missing")
+        }
         try expect(
-            listIndex < readIndex && readIndex < resumeIndex && resumeIndex < turnIndex,
+            listIndex < turnsIndex && turnsIndex < resumeIndex && resumeIndex < turnIndex
+                && turnsParams["threadId"] as? String == existingThreadID
+                && turnsParams["limit"] as? Int == 1
+                && turnsParams["sortDirection"] as? String == "desc"
+                && turnsParams["itemsView"] as? String == "notLoaded"
+                && !existingMethods.contains("thread/read"),
             "owner-selected thread executed before unarchived/project validation"
         )
         await existingRuntime.shutdown()
@@ -878,19 +926,13 @@ private enum CodexTaskRuntimeVerifier {
                 ),
             ]),
         ])
-        await activeTransport.setThreadReadResponses([
-            [
-                "thread": desktopThreadFixture(
-                    threadID: existingThreadID,
-                    cwd: projectDirectory.path,
-                    status: "active",
-                    turns: [[
-                        "id": "turn-already-running",
-                        "status": "inProgress",
-                        "items": [],
-                    ]]
-                ),
-            ],
+        await activeTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-already-running",
+                "status": "inProgress",
+                "itemsView": "notLoaded",
+                "items": [],
+            ]]),
         ])
         let activeRuntime = makeRuntime(transport: activeTransport)
         let activeText = "Also make the logo a little smaller."
@@ -939,30 +981,19 @@ private enum CodexTaskRuntimeVerifier {
                 ),
             ]),
         ])
-        await raceTransport.setThreadReadResponses([
-            [
-                "thread": desktopThreadFixture(
-                    threadID: existingThreadID,
-                    cwd: projectDirectory.path,
-                    turns: [[
-                        "id": "turn-before-race",
-                        "status": "completed",
-                        "items": [],
-                    ]]
-                ),
-            ],
-            [
-                "thread": desktopThreadFixture(
-                    threadID: existingThreadID,
-                    cwd: projectDirectory.path,
-                    status: "active",
-                    turns: [[
-                        "id": "turn-won-race",
-                        "status": "inProgress",
-                        "items": [],
-                    ]]
-                ),
-            ],
+        await raceTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-before-race",
+                "status": "completed",
+                "itemsView": "notLoaded",
+                "items": [],
+            ]]),
+            threadTurnsListFixture([[
+                "id": "turn-won-race",
+                "status": "inProgress",
+                "itemsView": "notLoaded",
+                "items": [],
+            ]]),
         ])
         await raceTransport.failNextTurnStart(message: "A turn is already active")
         let raceRuntime = makeRuntime(transport: raceTransport)
@@ -1002,7 +1033,9 @@ private enum CodexTaskRuntimeVerifier {
                 expectedWorkingDirectory: projectDirectory
             )
             throw VerificationFailure.failed("archived thread was accepted as a live project target")
-        } catch CodexTaskRuntimeError.threadUnavailable {
+        } catch CodexTaskRuntimeError.projectMessagePreparationFailed(
+            underlying: .threadUnavailable
+        ) {
             // Expected.
         }
         let archivedMethods = try decodeMessages(
@@ -1010,6 +1043,7 @@ private enum CodexTaskRuntimeVerifier {
         ).compactMap { $0["method"] as? String }
         try expect(
             !archivedMethods.contains("thread/read")
+                && !archivedMethods.contains("thread/turns/list")
                 && !archivedMethods.contains("thread/resume")
                 && !archivedMethods.contains("turn/start")
                 && !archivedMethods.contains("turn/steer"),
@@ -1036,10 +1070,56 @@ private enum CodexTaskRuntimeVerifier {
                 expectedWorkingDirectory: projectDirectory
             )
             throw VerificationFailure.failed("moved thread escaped its selected project boundary")
-        } catch CodexTaskRuntimeError.threadWorkingDirectoryChanged {
+        } catch CodexTaskRuntimeError.projectMessagePreparationFailed(
+            underlying: .threadWorkingDirectoryChanged
+        ) {
             // Expected.
         }
         await movedRuntime.shutdown()
+
+        let omittedViewTransport = FakeCodexAppServerTransport()
+        await omittedViewTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: "thread-omitted-items-view",
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+        ])
+        await omittedViewTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-defaults-to-full",
+                "status": "completed",
+                "items": [],
+            ]]),
+        ])
+        let omittedViewRuntime = makeRuntime(transport: omittedViewTransport)
+        do {
+            _ = try await omittedViewRuntime.sendRawProjectMessage(
+                taskID: "project.omitted-items-view",
+                threadID: "thread-omitted-items-view",
+                input: "Continue this.",
+                expectedWorkingDirectory: projectDirectory
+            )
+            throw VerificationFailure.failed(
+                "a turn with an implicit full item view entered the bounded project path"
+            )
+        } catch CodexTaskRuntimeError.projectMessagePreparationFailed(
+            underlying: .protocolViolation
+        ) {
+            // Expected: Turn.itemsView defaults to full when omitted.
+        }
+        let omittedViewMethods = try decodeMessages(
+            await omittedViewTransport.messageData()
+        ).compactMap { $0["method"] as? String }
+        try expect(
+            !omittedViewMethods.contains("thread/resume")
+                && !omittedViewMethods.contains("turn/start")
+                && !omittedViewMethods.contains("turn/steer"),
+            "an unproven bounded turn response reached message submission"
+        )
+        await omittedViewRuntime.shutdown()
     }
 
     private static func verifyExactProjectThreadReconciliation() async throws {
@@ -1059,22 +1139,20 @@ private enum CodexTaskRuntimeVerifier {
                 ),
             ]),
         ])
-        await terminalTransport.setThreadReadResponses([[
-            "thread": desktopThreadFixture(
-                threadID: terminalThreadID,
-                cwd: projectDirectory.path,
-                turns: [[
-                    "id": "turn-project-complete",
-                    "status": "completed",
-                    "items": [[
-                        "id": "item-project-final",
-                        "type": "agentMessage",
-                        "phase": "final_answer",
-                        "text": "The course plan is finished. Next, choose the day-two lab.",
-                    ]],
-                ]]
-            ),
-        ]])
+        await terminalTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-project-complete",
+                "status": "completed",
+                "itemsView": "summary",
+                "items": [[
+                    "id": "item-project-final",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "The course plan is finished. Next, choose the day-two lab.",
+                ]],
+            ]]),
+        ])
+        await terminalTransport.simulateOversizedHistoryOnIncludeTurns()
         let terminalRuntime = makeRuntime(transport: terminalTransport)
         let terminal = try await terminalRuntime.reconcileExactProjectThread(
             taskID: "project.inspect-terminal",
@@ -1095,9 +1173,17 @@ private enum CodexTaskRuntimeVerifier {
             await terminalTransport.messageData()
         )
         let terminalMethods = terminalMessages.compactMap { $0["method"] as? String }
+        let terminalTurnsParams = terminalMessages.first(where: {
+            $0["method"] as? String == "thread/turns/list"
+        })?["params"] as? [String: Any]
         try expect(
             terminalMethods.filter { $0 == "thread/list" }.count == 1
-                && terminalMethods.filter { $0 == "thread/read" }.count == 1
+                && terminalMethods.filter { $0 == "thread/turns/list" }.count == 1
+                && terminalTurnsParams?["threadId"] as? String == terminalThreadID
+                && terminalTurnsParams?["limit"] as? Int == 1
+                && terminalTurnsParams?["sortDirection"] as? String == "desc"
+                && terminalTurnsParams?["itemsView"] as? String == "summary"
+                && !terminalMethods.contains("thread/read")
                 && !terminalMethods.contains("thread/resume")
                 && !terminalMethods.contains("thread/start")
                 && !terminalMethods.contains("turn/start")
@@ -1126,37 +1212,32 @@ private enum CodexTaskRuntimeVerifier {
                     turns: []
                 ),
             ]),
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: racingThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
         ])
-        await racingTransport.setThreadReadResponses([
-            [
-                "thread": desktopThreadFixture(
-                    threadID: racingThreadID,
-                    cwd: projectDirectory.path,
-                    status: "active",
-                    turns: [[
-                        "id": "turn-project-racing",
-                        "status": "inProgress",
-                        "items": [],
-                    ]]
-                ),
-            ],
-            [
-                "thread": desktopThreadFixture(
-                    threadID: racingThreadID,
-                    cwd: projectDirectory.path,
-                    status: "idle",
-                    turns: [[
-                        "id": "turn-project-racing",
-                        "status": "completed",
-                        "items": [[
-                            "id": "item-project-racing-final",
-                            "type": "agentMessage",
-                            "phase": "final_answer",
-                            "text": "I finished the site and left one design question for you.",
-                        ]],
-                    ]]
-                ),
-            ],
+        await racingTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-project-racing",
+                "status": "inProgress",
+                "itemsView": "summary",
+                "items": [],
+            ]]),
+            threadTurnsListFixture([[
+                "id": "turn-project-racing",
+                "status": "completed",
+                "itemsView": "summary",
+                "items": [[
+                    "id": "item-project-racing-final",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "I finished the site and left one design question for you.",
+                ]],
+            ]]),
         ])
         let racingRuntime = makeRuntime(transport: racingTransport)
         let raced = try await racingRuntime.reconcileExactProjectThread(
@@ -1181,13 +1262,16 @@ private enum CodexTaskRuntimeVerifier {
         }
         let racingMethods = racingMessages.compactMap { $0["method"] as? String }
         try expect(
-            Set(resumeParams.keys) == Set(["threadId"])
-                && resumeParams["threadId"] as? String == racingThreadID,
+            Set(resumeParams.keys) == Set(["threadId", "excludeTurns"])
+                && resumeParams["threadId"] as? String == racingThreadID
+                && resumeParams["excludeTurns"] as? Bool == true,
             "project inspection overrode settings while subscribing"
         )
         try expect(
-            racingMethods.filter { $0 == "thread/read" }.count == 2
+            racingMethods.filter { $0 == "thread/list" }.count == 2
+                && racingMethods.filter { $0 == "thread/turns/list" }.count == 2
                 && racingMethods.filter { $0 == "thread/resume" }.count == 1
+                && !racingMethods.contains("thread/read")
                 && !racingMethods.contains("thread/start")
                 && !racingMethods.contains("turn/start")
                 && !racingMethods.contains("turn/steer"),
@@ -1209,6 +1293,7 @@ private enum CodexTaskRuntimeVerifier {
         let runningTurn: [String: Any] = [
             "id": "turn-project-running",
             "status": "inProgress",
+            "itemsView": "summary",
             "items": [],
         ]
         let runningTransport = FakeCodexAppServerTransport()
@@ -1220,24 +1305,17 @@ private enum CodexTaskRuntimeVerifier {
                     turns: []
                 ),
             ]),
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: runningThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
         ])
-        await runningTransport.setThreadReadResponses([
-            [
-                "thread": desktopThreadFixture(
-                    threadID: runningThreadID,
-                    cwd: projectDirectory.path,
-                    status: "active",
-                    turns: [runningTurn]
-                ),
-            ],
-            [
-                "thread": desktopThreadFixture(
-                    threadID: runningThreadID,
-                    cwd: projectDirectory.path,
-                    status: "active",
-                    turns: [runningTurn]
-                ),
-            ],
+        await runningTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([runningTurn]),
+            threadTurnsListFixture([runningTurn]),
         ])
         let runningRuntime = makeRuntime(transport: runningTransport)
         let running = try await runningRuntime.reconcileExactProjectThread(
@@ -1258,8 +1336,10 @@ private enum CodexTaskRuntimeVerifier {
             await runningTransport.messageData()
         ).compactMap { $0["method"] as? String }
         try expect(
-            runningMethods.filter { $0 == "thread/read" }.count == 2
+            runningMethods.filter { $0 == "thread/list" }.count == 2
+                && runningMethods.filter { $0 == "thread/turns/list" }.count == 2
                 && runningMethods.filter { $0 == "thread/resume" }.count == 1
+                && !runningMethods.contains("thread/read")
                 && !runningMethods.contains("turn/start")
                 && !runningMethods.contains("turn/steer"),
             "live project inspection emitted an action RPC"
@@ -1286,6 +1366,7 @@ private enum CodexTaskRuntimeVerifier {
         ).compactMap { $0["method"] as? String }
         try expect(
             !archivedMethods.contains("thread/read")
+                && !archivedMethods.contains("thread/turns/list")
                 && !archivedMethods.contains("thread/resume")
                 && !archivedMethods.contains("turn/start")
                 && !archivedMethods.contains("turn/steer"),
@@ -2641,6 +2722,17 @@ private enum CodexTaskRuntimeVerifier {
         [
             "data": threads,
             "nextCursor": nextCursor ?? NSNull(),
+        ]
+    }
+
+    private static func threadTurnsListFixture(
+        _ turns: [[String: Any]],
+        nextCursor: String? = nil
+    ) -> [String: Any] {
+        [
+            "data": turns,
+            "nextCursor": nextCursor ?? NSNull(),
+            "backwardsCursor": NSNull(),
         ]
     }
 

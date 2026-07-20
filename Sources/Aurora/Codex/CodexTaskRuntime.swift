@@ -12,6 +12,7 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
     case protocolViolation
     case inboundMessageTooLarge
     case outboundMessageTooLarge
+    indirect case projectMessagePreparationFailed(underlying: CodexTaskRuntimeError)
     case detachedPersistenceUnavailable
     case chatGPTLoginRequired
     case requestTimedOut(method: String)
@@ -50,6 +51,8 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
             return "The Codex app server exceeded its response boundary."
         case .outboundMessageTooLarge:
             return "The Codex request exceeded its size boundary."
+        case .projectMessagePreparationFailed(let underlying):
+            return "The selected Codex chat could not be prepared before message submission. \(underlying.localizedDescription)"
         case .detachedPersistenceUnavailable:
             return "The shared Codex daemon is required for work that must continue after Aurora closes."
         case .chatGPTLoginRequired:
@@ -873,33 +876,37 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
         try beginExclusiveTaskOperation(taskID)
         defer { busyTaskIDs.remove(taskID) }
 
-        try await start()
-        try requireVerifiedChatGPTAccount()
-        try await requireUnarchivedPersistentThread(
-            threadID: threadID,
-            expectedWorkingDirectory: expectedDirectory
-        )
-        let initialState = try await rawProjectTurnState(
-            threadID: threadID,
-            expectedWorkingDirectory: expectedDirectory
-        )
-        try validatePreservingThreadBinding(
-            taskID: taskID,
-            threadID: threadID,
-            expectedWorkingDirectory: expectedDirectory
-        )
-        if !loadedThreadIDs.contains(threadID) {
-            try await resumePreservingThreadSettings(
+        let initialState: RawProjectTurnState
+        do {
+            try await start()
+            try requireVerifiedChatGPTAccount()
+            _ = try await requireUnarchivedPersistentThread(
                 threadID: threadID,
                 expectedWorkingDirectory: expectedDirectory
             )
+            initialState = try await rawProjectTurnState(
+                threadID: threadID
+            )
+            try validatePreservingThreadBinding(
+                taskID: taskID,
+                threadID: threadID,
+                expectedWorkingDirectory: expectedDirectory
+            )
+            if !loadedThreadIDs.contains(threadID) {
+                try await resumePreservingThreadSettings(
+                    threadID: threadID,
+                    expectedWorkingDirectory: expectedDirectory
+                )
+            }
+            try bindPreservingThreadSettings(
+                taskID: taskID,
+                to: threadID,
+                expectedWorkingDirectory: expectedDirectory
+            )
+            synchronizeRawTurnState(initialState, taskID: taskID)
+        } catch {
+            throw Self.projectMessagePreparationFailure(from: error)
         }
-        try bindPreservingThreadSettings(
-            taskID: taskID,
-            to: threadID,
-            expectedWorkingDirectory: expectedDirectory
-        )
-        synchronizeRawTurnState(initialState, taskID: taskID)
         let clientMessageID = Self.makeClientMessageID()
 
         do {
@@ -916,14 +923,18 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
             // read. Re-read once and retry only when that observable state
             // actually changed. Transport failures and unchanged rejections
             // are never replayed, preventing duplicate owner messages.
-            try await requireUnarchivedPersistentThread(
-                threadID: threadID,
-                expectedWorkingDirectory: expectedDirectory
-            )
-            let refreshedState = try await rawProjectTurnState(
-                threadID: threadID,
-                expectedWorkingDirectory: expectedDirectory
-            )
+            let refreshedState: RawProjectTurnState
+            do {
+                _ = try await requireUnarchivedPersistentThread(
+                    threadID: threadID,
+                    expectedWorkingDirectory: expectedDirectory
+                )
+                refreshedState = try await rawProjectTurnState(
+                    threadID: threadID
+                )
+            } catch {
+                throw Self.projectMessagePreparationFailure(from: error)
+            }
             guard refreshedState != initialState else { throw original }
             synchronizeRawTurnState(refreshedState, taskID: taskID)
             return try await performRawProjectSend(
@@ -971,18 +982,17 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
 
         try await start()
         try requireVerifiedChatGPTAccount()
-        try await requireUnarchivedPersistentThread(
+        var threadSummary = try await requireUnarchivedPersistentThread(
             threadID: threadID,
             expectedWorkingDirectory: expectedDirectory
         )
-        let firstRead = try await rpc(method: "thread/read", params: [
-            "threadId": threadID,
-            "includeTurns": true,
-        ])
+        var latestTurn = try await latestProjectTurn(
+            threadID: threadID,
+            itemsView: "summary"
+        )
         var observation = try Self.exactProjectReconciliation(
-            from: firstRead,
-            expectedThreadID: threadID,
-            expectedWorkingDirectory: expectedDirectory
+            thread: threadSummary,
+            latestTurn: latestTurn
         )
         try validatePreservingThreadBinding(
             taskID: taskID,
@@ -1012,14 +1022,17 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
             // Close read→subscribe races. Completion before resume is captured
             // here; completion after this read arrives through the now-bound
             // runtime event stream.
-            let refreshed = try await rpc(method: "thread/read", params: [
-                "threadId": threadID,
-                "includeTurns": true,
-            ])
-            observation = try Self.exactProjectReconciliation(
-                from: refreshed,
-                expectedThreadID: threadID,
+            threadSummary = try await requireUnarchivedPersistentThread(
+                threadID: threadID,
                 expectedWorkingDirectory: expectedDirectory
+            )
+            latestTurn = try await latestProjectTurn(
+                threadID: threadID,
+                itemsView: "summary"
+            )
+            observation = try Self.exactProjectReconciliation(
+                thread: threadSummary,
+                latestTurn: latestTurn
             )
             synchronizeReconciledTurn(observation, taskID: taskID)
         }
@@ -1523,6 +1536,10 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
     ) async throws {
         let result = try await rpc(method: "thread/resume", params: [
             "threadId": threadID,
+            // A selected Desktop chat may contain hundreds of megabytes of
+            // history. Resuming is only a subscription boundary; hydrating
+            // every prior turn here is both unnecessary and unsafe.
+            "excludeTurns": true,
         ])
         guard try Self.threadID(from: result) == threadID else {
             throw CodexTaskRuntimeError.protocolViolation
@@ -1547,7 +1564,7 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
     private func requireUnarchivedPersistentThread(
         threadID: String,
         expectedWorkingDirectory: URL
-    ) async throws {
+    ) async throws -> AuroraCodexThreadSummary {
         var cursor: String?
         var seenCursors = Set<String>()
         // Project selection is normally followed immediately by this check.
@@ -1587,7 +1604,7 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
                 guard !summary.ephemeral else {
                     throw CodexTaskRuntimeError.threadUnavailable
                 }
-                return
+                return summary
             }
             guard let nextCursor = try Self.optionalBoundedProtocolString(
                 object["nextCursor"],
@@ -1604,32 +1621,14 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
     }
 
     private func rawProjectTurnState(
-        threadID: String,
-        expectedWorkingDirectory: URL
+        threadID: String
     ) async throws -> RawProjectTurnState {
-        let result = try await rpc(method: "thread/read", params: [
-            "threadId": threadID,
-            "includeTurns": true,
-        ])
-        let object = try Self.decodeObject(
-            result,
-            maximumBytes: configuration.maximumInboundLineBytes
-        )
-        guard let thread = object["thread"] as? [String: Any] else {
-            throw CodexTaskRuntimeError.protocolViolation
+        guard let latestTurn = try await latestProjectTurn(
+            threadID: threadID,
+            itemsView: "notLoaded"
+        ) else {
+            return .inactive
         }
-        let summary = try Self.desktopThreadSummary(thread)
-        guard summary.threadID == threadID else {
-            throw CodexTaskRuntimeError.protocolViolation
-        }
-        guard summary.workingDirectory.path == expectedWorkingDirectory.path else {
-            throw CodexTaskRuntimeError.threadWorkingDirectoryChanged
-        }
-        guard !summary.ephemeral,
-              let turns = thread["turns"] as? [[String: Any]] else {
-            throw CodexTaskRuntimeError.threadUnavailable
-        }
-        guard let latestTurn = turns.last else { return .inactive }
         let turnID = try Self.requiredString("id", in: latestTurn)
         try Self.validateOpaqueID(turnID)
         switch latestTurn["status"] as? String {
@@ -1640,6 +1639,67 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
         default:
             throw CodexTaskRuntimeError.protocolViolation
         }
+    }
+
+    /// Reads exactly one latest turn without hydrating the selected chat's
+    /// complete history. `thread/read(includeTurns: true)` is intentionally
+    /// forbidden on this path: an old, active Desktop conversation can be far
+    /// larger than Aurora's bounded app-server transport.
+    private func latestProjectTurn(
+        threadID: String,
+        itemsView: String
+    ) async throws -> [String: Any]? {
+        guard itemsView == "notLoaded" || itemsView == "summary" else {
+            throw CodexTaskRuntimeError.invalidInput
+        }
+        let result = try await rpc(method: "thread/turns/list", params: [
+            "threadId": threadID,
+            "limit": 1,
+            "sortDirection": "desc",
+            "itemsView": itemsView,
+        ])
+        let object = try Self.decodeObject(
+            result,
+            maximumBytes: configuration.maximumInboundLineBytes
+        )
+        guard let turns = object["data"] as? [[String: Any]],
+              turns.count <= 1 else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        guard let latestTurn = turns.first else { return nil }
+        let turnID = try Self.requiredString("id", in: latestTurn)
+        try Self.validateOpaqueID(turnID)
+        guard let status = latestTurn["status"] as? String,
+              Set(["inProgress", "completed", "interrupted", "failed"])
+                .contains(status),
+              let items = latestTurn["items"] as? [[String: Any]] else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        // `Turn.itemsView` defaults to `full` when omitted. Require the
+        // explicit echo so a server that ignored our bounded projection can
+        // never smuggle a fully hydrated turn back onto this path.
+        guard latestTurn["itemsView"] as? String == itemsView else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        guard itemsView != "notLoaded" || items.isEmpty else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        return latestTurn
+    }
+
+    private static func projectMessagePreparationFailure(
+        from error: Error
+    ) -> CodexTaskRuntimeError {
+        if let runtimeError = error as? CodexTaskRuntimeError {
+            if case .projectMessagePreparationFailed = runtimeError {
+                return runtimeError
+            }
+            return .projectMessagePreparationFailed(underlying: runtimeError)
+        }
+        if error is CancellationError {
+            return .projectMessagePreparationFailed(underlying: .requestCancelled)
+        }
+        return .projectMessagePreparationFailed(underlying: .protocolViolation)
     }
 
     private func synchronizeRawTurnState(
@@ -2646,29 +2706,62 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
     }
 
     private static func exactProjectReconciliation(
-        from data: Data,
-        expectedThreadID: String,
-        expectedWorkingDirectory: URL
+        thread: AuroraCodexThreadSummary,
+        latestTurn: [String: Any]?
     ) throws -> CodexDelegateTaskReconciliation {
-        let object = try jsonObject(data)
-        guard let thread = object["thread"] as? [String: Any] else {
-            throw CodexTaskRuntimeError.protocolViolation
-        }
-        let summary = try desktopThreadSummary(thread)
-        guard summary.threadID == expectedThreadID else {
-            throw CodexTaskRuntimeError.protocolViolation
-        }
-        guard !summary.ephemeral else {
+        guard !thread.ephemeral else {
             throw CodexTaskRuntimeError.threadUnavailable
         }
-        guard summary.workingDirectory.path
-                == expectedWorkingDirectory.standardizedFileURL.path else {
-            throw CodexTaskRuntimeError.threadWorkingDirectoryChanged
+
+        let latestTurnID: String?
+        let status: CodexDelegateTaskObservedStatus?
+        var resultSummary: String?
+        if let latestTurn {
+            let turnID = try requiredString("id", in: latestTurn)
+            try validateOpaqueID(turnID)
+            latestTurnID = turnID
+            switch latestTurn["status"] as? String {
+            case "inProgress": status = .running
+            case "completed": status = .completed
+            case "interrupted": status = .cancelled
+            case "failed": status = .failed
+            default: throw CodexTaskRuntimeError.protocolViolation
+            }
+
+            guard let items = latestTurn["items"] as? [[String: Any]] else {
+                throw CodexTaskRuntimeError.protocolViolation
+            }
+            let messages = items.compactMap { item -> (String, String?)? in
+                guard item["type"] as? String == "agentMessage",
+                      let text = item["text"] as? String,
+                      !text.isEmpty else { return nil }
+                return (text, item["phase"] as? String)
+            }
+            if status == .failed,
+               let error = latestTurn["error"] as? [String: Any],
+               let message = error["message"] as? String,
+               !message.isEmpty {
+                resultSummary = message
+            } else {
+                resultSummary = messages.last(where: { $0.1 == "final_answer" })?.0
+                    ?? messages.last?.0
+            }
+            if status == .cancelled, resultSummary == nil {
+                resultSummary = "The task was cancelled."
+            }
+        } else {
+            latestTurnID = nil
+            status = nil
         }
-        return try reconciliation(
-            from: data,
-            expectedThreadID: expectedThreadID,
-            expectedDynamicToolNames: []
+
+        return CodexDelegateTaskReconciliation(
+            threadID: thread.threadID,
+            latestTurnID: latestTurnID,
+            status: status,
+            resultSummary: resultSummary.map { String($0.prefix(8_000)) },
+            threadName: thread.name.map { String($0.prefix(500)) },
+            workspacePath: thread.workingDirectory.path,
+            effectReceipts: []
         )
     }
 

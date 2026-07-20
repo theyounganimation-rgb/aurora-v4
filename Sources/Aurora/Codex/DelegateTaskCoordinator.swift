@@ -1613,10 +1613,14 @@ actor DelegateTaskCoordinator {
             )
         } catch {
             let acceptanceUnknown = Self.isAmbiguousProjectChatDispatchFailure(error)
+            let explicitRejection = Self.isExplicitProjectChatRejection(error)
+            let terminalSummary = explicitRejection
+                ? "Codex rejected the project-chat message."
+                : "The selected Codex chat could not be reached, so the message was not sent."
             if var failed = records[taskID] {
                 let summary = acceptanceUnknown
                     ? "The Codex connection changed before message acceptance could be confirmed."
-                    : "Codex rejected the project-chat message."
+                    : terminalSummary
                 if !acceptanceUnknown,
                    let operationID = Self.latestAuthorizedOperationID(in: failed) {
                     Self.appendLedgerEntry(
@@ -1650,7 +1654,9 @@ actor DelegateTaskCoordinator {
             }
             return projectChatFailure(
                 .executionFailed,
-                "Codex rejected that message, so it was not treated as accepted."
+                explicitRejection
+                    ? "Codex rejected that message, so it was not treated as accepted."
+                    : "The selected Codex chat could not be reached, so the message was not sent."
             )
         }
     }
@@ -1762,6 +1768,12 @@ actor DelegateTaskCoordinator {
         default:
             return false
         }
+    }
+
+    private static func isExplicitProjectChatRejection(_ error: Error) -> Bool {
+        guard let runtimeError = error as? CodexTaskRuntimeError else { return false }
+        if case .serverError = runtimeError { return true }
+        return false
     }
 
     private static func matchingProjects(

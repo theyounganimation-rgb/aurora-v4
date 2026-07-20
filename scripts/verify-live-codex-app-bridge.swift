@@ -91,6 +91,7 @@ private enum LiveBridgeVerificationError: LocalizedError {
   case activeThreadNotVisible
   case turnDidNotTerminate
   case turnIdentityChanged
+  case unsafeArchiveAvoided
   case archivedThreadNotVisible
   case cleanupFailed(primary: String, cleanup: String)
 
@@ -108,6 +109,8 @@ private enum LiveBridgeVerificationError: LocalizedError {
       return "The protocol-only Codex turn did not reach a terminal state."
     case .turnIdentityChanged:
       return "A different Codex turn replaced the exact protocol-only turn under test."
+    case .unsafeArchiveAvoided:
+      return "The second turn's acceptance was unknown, so the verifier left the test thread visible instead of archiving potentially active work."
     case .archivedThreadNotVisible:
       return "The protocol-only Codex thread was not visible in the archived task list."
     case .cleanupFailed(let primary, let cleanup):
@@ -127,8 +130,9 @@ private enum LiveCodexAppBridgeVerifier {
       throw LiveBridgeVerificationError.explicitOptInRequired
     }
 
-    let runtime = CodexTaskRuntime()
+    var runtime = CodexTaskRuntime()
     let taskID = "aurora-live-bridge-\(UUID().uuidString.lowercased())"
+    var activeTaskID = taskID
     let verificationToken = "aurora-live-bridge-\(UUID().uuidString.lowercased())"
     var createdThreadID: String?
     var createdTurnID: String?
@@ -192,6 +196,37 @@ private enum LiveCodexAppBridgeVerifier {
         threadID: handle.threadID,
         name: verificationToken
       )
+
+      // Reconnect before the second message so this is a genuine append to a
+      // pre-existing Desktop chat, not merely another turn on an in-memory
+      // runtime. This is the same boundary Aurora crosses after selecting an
+      // older project chat by name.
+      await runtime.shutdown()
+      runtime = CodexTaskRuntime()
+      guard try await runtime.supportsDetachedTaskPersistence() else {
+        throw LiveBridgeVerificationError.sharedDaemonRequired
+      }
+      let continuedTaskID = "\(taskID)-existing"
+      activeTaskID = continuedTaskID
+      createdTurnID = nil
+      terminalConfirmed = false
+      let continued = try await runtime.sendExactMessage(
+        taskID: continuedTaskID,
+        threadID: handle.threadID,
+        input: "Confirm this exact existing Codex chat accepted a second message. Make no external changes.",
+        expectedWorkingDirectory: options.workingDirectory!
+      )
+      createdTurnID = continued.turnID
+      try await waitForExactProjectTerminal(
+        runtime: runtime,
+        taskID: continuedTaskID,
+        threadID: continued.threadID,
+        turnID: continued.turnID,
+        workingDirectory: options.workingDirectory!,
+        timeout: .seconds(45)
+      )
+      terminalConfirmed = true
+
       try await archiveAndConfirm(
         runtime: runtime,
         threadID: handle.threadID,
@@ -206,8 +241,9 @@ private enum LiveCodexAppBridgeVerifier {
         "rawProjectChat": true,
         "threadCreated": true,
         "turnCreated": true,
+        "existingThreadContinuedAfterReconnect": true,
         "threadArchived": true,
-        "realModelCalls": 1,
+        "realModelCalls": 2,
       ]
       let data = try JSONSerialization.data(
         withJSONObject: payload,
@@ -221,16 +257,18 @@ private enum LiveCodexAppBridgeVerifier {
       }
       if let createdThreadID {
         do {
-          try? await runtime.interruptTask(taskID: taskID)
-          if !terminalConfirmed,
-            let turnID = createdTurnID,
-            let workingDirectory = createdOptions?.workingDirectory
-          {
+          try? await runtime.interruptTask(taskID: activeTaskID)
+          if !terminalConfirmed {
+            guard let turnID = createdTurnID,
+              let workingDirectory = createdOptions?.workingDirectory
+            else {
+              throw LiveBridgeVerificationError.unsafeArchiveAvoided
+            }
             // If the turn remains active, prove that exact turn is terminal
             // before hiding its thread from the user's task list.
             try await waitForExactProjectTerminal(
               runtime: runtime,
-              taskID: taskID,
+              taskID: activeTaskID,
               threadID: createdThreadID,
               turnID: turnID,
               workingDirectory: workingDirectory,
@@ -267,20 +305,21 @@ private enum LiveCodexAppBridgeVerifier {
   ) async throws {
     let clock = ContinuousClock()
     let deadline = clock.now.advanced(by: timeout)
+    var observedExpectedTurn = false
     repeat {
       let observation = try await runtime.reconcileExactProjectThread(
         taskID: taskID,
         threadID: threadID,
         expectedWorkingDirectory: workingDirectory
       )
-      if let latestTurnID = observation.latestTurnID, latestTurnID != turnID {
+      if observedExpectedTurn, observation.latestTurnID != turnID {
         throw LiveBridgeVerificationError.turnIdentityChanged
       }
-      if observation.latestTurnID == turnID,
-        let status = observation.status,
-        status != .running
-      {
-        return
+      if observation.latestTurnID == turnID {
+        observedExpectedTurn = true
+        if let status = observation.status, status != .running {
+          return
+        }
       }
       try await Task.sleep(for: .milliseconds(100))
     } while clock.now < deadline
