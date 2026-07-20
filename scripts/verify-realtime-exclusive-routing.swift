@@ -124,6 +124,7 @@ private enum RealtimeExclusiveRoutingVerifier {
 
     private static let allowedNames: Set<String> = [
         "delegate_task",
+        "codex_project_chat",
         "conversation_move",
         "memory_search",
         "memory_read",

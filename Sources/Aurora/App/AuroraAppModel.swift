@@ -29,7 +29,7 @@ enum AuroraToolEffectTruth {
               result.metadata["silence_rejected"]?.boolValue != true else {
             return nil
         }
-        if toolName == "delegate_task",
+        if (toolName == "delegate_task" || toolName == "codex_project_chat"),
            result.ok,
            result.metadata["effect_verified"]?.boolValue != true {
             // Dispatch, provider completion, or a posted pointer event is not
@@ -1385,7 +1385,10 @@ final class AuroraAppModel: ObservableObject {
             }
         }
         realtime.onFunctionCall = { [weak self] call in
-            guard let self, call.connectionID == self.activeConnectionID else { return }
+            // `acceptFunctionCall` owns the exact transport-boundary policy.
+            // Do not discard a finalized durable Codex handoff here merely
+            // because a transparent Realtime reconnect replaced its socket.
+            guard let self else { return }
             self.acceptFunctionCall(call)
         }
         realtime.onError = { [weak self] connectionID, error in

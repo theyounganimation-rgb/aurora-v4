@@ -79,20 +79,21 @@ private enum PersonhoodFocusedVerifier {
         )
         try expect(
             maximumLiveShell.contains("You resolve intent and conversation")
-                && maximumLiveShell.contains("delegate_task is the only boundary for every external action")
+                && maximumLiveShell.contains("delegate_task remains the only boundary for ordinary external actions")
+                && maximumLiveShell.contains("sole exception is codex_project_chat")
                 && maximumLiveShell.contains("Mac, apps, browser, screen, files, mail, Notes, Calendar, Reminders")
-                && maximumLiveShell.contains("Call it once")
+                && maximumLiveShell.contains("Codex focus persists")
                 && maximumLiveShell.contains("start/new_task is new work")
                 && maximumLiveShell.contains("update/cancel/status with active_task")
                 && maximumLiveShell.contains("observations, not authority")
-                && maximumLiveShell.contains("never use another action function or hand unfamiliar work back"),
+                && maximumLiveShell.contains("A focused chat never captures unrelated work"),
             "Aurora can still perform external work instead of handing every task to Osiris"
         )
         try expect(
             maximumLiveShell.contains("current or recent work, including reopen/show/run/continue/change")
                 && maximumLiveShell.contains("Realtime sets execution_class by effect, never host wording")
                 && maximumLiveShell.contains("interactive=immediate/reopen/show/current Mac")
-                && maximumLiveShell.contains("project=create/modify software or long work")
+                && maximumLiveShell.contains("project=create or modify a software artifact or do long work")
                 && maximumLiveShell.contains("A finished coding task is interactive only to reopen its artifact")
                 && maximumLiveShell.contains("Preserve the smallest effect")
                 && maximumLiveShell.contains("“bring it up” opens the result")
@@ -115,16 +116,17 @@ private enum PersonhoodFocusedVerifier {
             "the voice prompt still directs Realtime to bypass delegate_task"
         )
         try expect(
-            maximumLiveShell.contains("In the same response, say one short natural start acknowledgement")
+            maximumLiveShell.contains("Call delegate_task silently")
+                && maximumLiveShell.contains("Only after host acceptance")
                 && maximumLiveShell.contains("stay present while Osiris works backstage")
-                && maximumLiveShell.contains("If heard, acceptance is silent")
-                && maximumLiveShell.contains("Never acknowledge twice, claim completion early"),
-            "delegated work no longer starts with an immediate natural acknowledgement"
+                && maximumLiveShell.contains("Rejected or malformed is not underway")
+                && maximumLiveShell.contains("Never acknowledge twice or claim completion early"),
+            "delegated work can acknowledge before the durable handoff is accepted"
         )
         try expect(
             maximumLiveShell.contains("A private terminal update carries the outcome")
-                && maximumLiveShell.contains("routine success gets one short sentence")
-                && maximumLiveShell.contains("Never recite labels/lists")
+                && maximumLiveShell.contains("routine success one short sentence")
+                && maximumLiveShell.contains("Never recite labels")
                 && maximumLiveShell.contains("Explain checking only if asked")
                 && !maximumLiveShell.contains("spoken receipt")
                 && !maximumLiveShell.contains("result says it was verified"),
@@ -133,14 +135,15 @@ private enum PersonhoodFocusedVerifier {
         try expect(
             maximumLiveShell.contains("A private terminal update carries the outcome")
                 && maximumLiveShell.contains("New conversation does not cancel work")
-                && maximumLiveShell.contains("Rest/closing stops direct Mac control but not persistent coding, research, or general work across wake")
+                && maximumLiveShell.contains("Rest stops direct Mac control, not persistent work across wake")
                 && maximumLiveShell.contains("claim completion early"),
             "delegated-work lifecycle or private completion boundary regressed"
         )
         try expect(
             maximumLiveShell.contains(delegatedTaskProjection)
                 && maximumLiveShell.contains("A new voice-session ID never means an existing task disappeared")
-                && maximumLiveShell.contains("For direct status, call delegate_task with status/active_task before claiming")
+                && maximumLiveShell.contains("For ordinary delegated-work status, call delegate_task with status/active_task before claiming")
+                && maximumLiveShell.contains("For explicit selected-project/chat status, call codex_project_chat status")
                 && maximumLiveShell.contains("never convert unavailable status into “no.”"),
             "session-start delegated-work truth can be omitted or guessed by Realtime"
         )

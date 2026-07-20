@@ -178,6 +178,10 @@ enum RealtimeToolContinuation: Equatable {
     /// that decision with an assistant-style default.
     case conversationMove
     case delegateAccepted
+    /// Realtime produced an invalid structured task proposal. Correct the
+    /// structure once against the original finalized owner turn without
+    /// speaking or widening the authorized effect.
+    case delegateRetry
     case silent
     case complete
 }

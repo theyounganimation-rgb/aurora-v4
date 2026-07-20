@@ -150,6 +150,41 @@ struct DelegateTaskCoordinatorResult: Sendable, Equatable {
     let detail: String
 }
 
+enum CodexProjectChatResultCode: String, Sendable, Equatable {
+    case projectsListed = "projects_listed"
+    case projectFocused = "project_focused"
+    case chatFocused = "chat_focused"
+    case newChatReady = "new_chat_ready"
+    case accepted
+    case duplicate
+    case focusLeft = "focus_left"
+    case status
+    case ambiguousProject = "ambiguous_project"
+    case ambiguousChat = "ambiguous_chat"
+    case projectUnavailable = "project_unavailable"
+    case chatUnavailable = "chat_unavailable"
+    case focusUnavailable = "focus_unavailable"
+    case staleTarget = "stale_target"
+    case authorizationExpired = "authorization_expired"
+    case effectMismatch = "effect_mismatch"
+    case executionFailed = "execution_failed"
+    case acceptanceUnknown = "acceptance_unknown"
+}
+
+struct CodexProjectChatResult: Sendable, Equatable {
+    let ok: Bool
+    let code: CodexProjectChatResultCode
+    let detail: String
+    let threadID: String?
+    let taskID: String?
+    let backgroundTask: Bool
+}
+
+enum CodexProjectChatPreparation: Sendable, Equatable {
+    case ready(CodexProjectChatResolvedTarget)
+    case failed(CodexProjectChatResult)
+}
+
 enum DelegateTaskRuntimeReadiness: Sendable, Equatable {
     case checking
     case ready
@@ -188,17 +223,124 @@ protocol CodexDelegateTaskRunning: Sendable {
         threadID: String,
         options: CodexTaskThreadOptions
     ) async throws -> CodexDelegateTaskReconciliation
+    func reconcileExactProjectThread(
+        taskID: String,
+        threadID: String,
+        expectedWorkingDirectory: URL
+    ) async throws -> CodexDelegateTaskReconciliation
     func supportsDetachedTaskPersistence() async throws -> Bool
     func shutdown() async
+    func listThreads(
+        query: AuroraCodexThreadQuery
+    ) async throws -> AuroraCodexThreadPage
+    func readThread(
+        threadID: String,
+        includeTurns: Bool
+    ) async throws -> AuroraCodexThreadDocument
+    func sendExactMessage(
+        taskID: String,
+        threadID: String,
+        input: String,
+        expectedWorkingDirectory: URL
+    ) async throws -> CodexTaskHandle
+    func startRawProjectThread(
+        taskID: String,
+        input: String,
+        options: CodexTaskThreadOptions
+    ) async throws -> CodexTaskHandle
+    func openThreadInDesktop(threadID: String) async -> Bool
 }
 
 extension CodexTaskRuntime: CodexDelegateTaskRunning {}
+
+extension CodexDelegateTaskRunning {
+    func reconcileExactProjectThread(
+        taskID _: String,
+        threadID _: String,
+        expectedWorkingDirectory _: URL
+    ) async throws -> CodexDelegateTaskReconciliation {
+        throw CodexTaskRuntimeError.processUnavailable
+    }
+
+    func listThreads(
+        query _: AuroraCodexThreadQuery
+    ) async throws -> AuroraCodexThreadPage {
+        throw CodexTaskRuntimeError.processUnavailable
+    }
+
+    func readThread(
+        threadID _: String,
+        includeTurns _: Bool
+    ) async throws -> AuroraCodexThreadDocument {
+        throw CodexTaskRuntimeError.processUnavailable
+    }
+
+    func sendExactMessage(
+        taskID _: String,
+        threadID _: String,
+        input _: String,
+        expectedWorkingDirectory _: URL
+    ) async throws -> CodexTaskHandle {
+        throw CodexTaskRuntimeError.processUnavailable
+    }
+
+    func startRawProjectThread(
+        taskID: String,
+        input: String,
+        options: CodexTaskThreadOptions
+    ) async throws -> CodexTaskHandle {
+        try await startTask(taskID: taskID, input: input, options: options)
+    }
+
+    func openThreadInDesktop(threadID _: String) async -> Bool { false }
+}
 
 /// Owns Aurora's long-running backstage work. It is deliberately independent
 /// from the foreground Realtime tool task so owner barge-in can interrupt a
 /// spoken receipt without destroying already-authorized work.
 actor DelegateTaskCoordinator {
     typealias EventHandler = @Sendable (DelegateTaskEvent) async -> Void
+
+    private struct CodexProjectCatalogEntry {
+        let projectID: String?
+        let displayName: String
+        let workspaceURL: URL
+        let workspaceRoots: [URL]
+        let threads: [AuroraCodexThreadSummary]
+    }
+
+    private struct CodexDesktopProject {
+        let projectID: String
+        let displayName: String
+        let workspaceRoots: [URL]
+    }
+
+    private struct CodexDesktopThreadAssignment: Decodable {
+        let projectKind: String
+        let projectId: String
+        let path: String?
+        let cwd: String?
+    }
+
+    private struct CodexDesktopProjectDocument: Decodable {
+        let name: String
+        let rootPaths: [String]
+    }
+
+    private struct CodexDesktopGlobalState: Decodable {
+        let localProjects: [String: CodexDesktopProjectDocument]
+        let threadProjectAssignments: [String: CodexDesktopThreadAssignment]?
+
+        enum CodingKeys: String, CodingKey {
+            case localProjects = "local-projects"
+            case threadProjectAssignments = "thread-project-assignments"
+        }
+    }
+
+    private struct CodexDesktopRegistry {
+        let projects: [CodexDesktopProject]
+        let assignments: [String: CodexDesktopThreadAssignment]
+    }
 
     private struct TaskTurnKey: Hashable {
         let taskID: String
@@ -266,6 +408,7 @@ actor DelegateTaskCoordinator {
         var effectReportingContractVersion: Int?
         var cancelRequested = false
         var lastProgressEmissionAt: Date?
+        let isProjectChat: Bool
     }
 
     private let runtime: any CodexDelegateTaskRunning
@@ -278,8 +421,51 @@ actor DelegateTaskCoordinator {
     private var runtimeHandlerInstalled = false
     private var records: [String: Record] = [:]
     private var latestTaskBySession: [String: String] = [:]
+    private var projectChatFocus: CodexProjectChatPersistedFocus?
+    private var projectChatGeneration: UInt64 = 0
+    private struct ProjectChatRequestScope: Equatable {
+        let proposal: CodexProjectChatProposal
+        let authorization: CodexProjectChatAuthorizationEnvelope
+    }
+    private struct InFlightProjectChatRequest {
+        let scope: ProjectChatRequestScope
+        let task: Task<CodexProjectChatResult, Never>
+    }
+    private var projectChatRequestResults: [String: (ProjectChatRequestScope, CodexProjectChatResult)] = [:]
+    private var projectChatRequestOrder: [String] = []
+    private var inFlightProjectChatRequests: [String: InFlightProjectChatRequest] = [:]
+    private var projectChatDispatchTail: Task<Void, Never>?
+    private var projectChatDispatchTailToken: UUID?
     private var requestResults: [String: DelegateTaskCoordinatorResult] = [:]
     private var requestOrder: [String] = []
+    private struct StartAuthorizationScope: Equatable {
+        let requestID: String
+        let sourceTurnIDs: [String]
+        let sessionID: String
+        let speakerBinding: AuthorizationSpeakerBinding
+        let operation: DelegateTaskOperation
+        let allowedEffect: DelegateTaskEffect
+        let activeTaskBinding: DelegateTaskAuthorizationBinding?
+        let confirmationState: AuthorizationConfirmationState
+
+        init(_ authorization: DelegateTaskAuthorizationEnvelope) {
+            requestID = authorization.requestID
+            sourceTurnIDs = authorization.sourceTurnIDs
+            sessionID = authorization.sessionID
+            speakerBinding = authorization.speakerBinding
+            operation = authorization.operation
+            allowedEffect = authorization.allowedEffect
+            activeTaskBinding = authorization.activeTaskBinding
+            confirmationState = authorization.confirmationState
+        }
+    }
+    private struct InFlightStartRequest {
+        let proposal: DelegateTaskProposal
+        let authorizationScope: StartAuthorizationScope
+        let task: Task<DelegateTaskCoordinatorResult, Never>
+    }
+    private var startRequestScopes: [String: StartAuthorizationScope] = [:]
+    private var inFlightStartRequests: [String: InFlightStartRequest] = [:]
     private var launchTasks: [String: Task<Void, Never>] = [:]
     /// A proxy/RPC lifecycle failure is loss of observation, not proof that a
     /// mapped persistent Codex turn stopped in the shared daemon.
@@ -347,14 +533,26 @@ actor DelegateTaskCoordinator {
         do {
             storeProcessLock = try store.acquireExclusiveProcessLock()
             if let state = try store.load() {
+                if let focus = state.projectChatFocus,
+                   Self.validProjectChatFocus(focus, homeDirectory: standardizedHome) {
+                    projectChatFocus = focus
+                } else if state.projectChatFocus != nil {
+                    throw DelegateTaskStoreError.corruptState
+                }
+                projectChatGeneration = state.projectChatGeneration
+                    ?? (state.projectChatFocus == nil ? 0 : 1)
                 var seenTaskIDs = Set<String>()
+                var seenThreadIDs = Set<String>()
                 for persisted in state.records {
                     guard seenTaskIDs.insert(persisted.taskID).inserted,
                           let restored = Self.restoreRecord(
                             persisted,
                             homeDirectory: standardizedHome
-                          ) else { throw DelegateTaskStoreError.corruptState }
+                          ),
+                          restored.codexThreadID.map({ seenThreadIDs.insert($0).inserted })
+                            ?? true else { throw DelegateTaskStoreError.corruptState }
                     records[restored.taskID] = restored
+                    if restored.isProjectChat { continue }
                     if let priorID = latestTaskBySession[restored.sessionID],
                        let prior = records[priorID], prior.updatedAt >= restored.updatedAt {
                         continue
@@ -387,7 +585,8 @@ actor DelegateTaskCoordinator {
                     effectReportingContractVersion: nil,
                     cancelRequested: candidate.taskKind == .computer
                         && !candidate.status.isTerminal,
-                    lastProgressEmissionAt: nil
+                    lastProgressEmissionAt: nil,
+                    isProjectChat: false
                 )
                 records[migrated.taskID] = migrated
                 latestTaskBySession[migrated.sessionID] = migrated.taskID
@@ -437,21 +636,1263 @@ actor DelegateTaskCoordinator {
     /// delay Aurora's Realtime connection. Exact reconciliation follows in the
     /// background and direct status requests still perform a live read.
     func cachedSessionContext(sessionID: String) -> String {
+        let ordinaryContext: String
         if let taskID = latestTaskBySession[sessionID] ?? latestPersistentTaskID(),
            let record = records[taskID] {
             latestTaskBySession[sessionID] = taskID
-            return Self.sessionContextText(record)
-        }
-        if storeFailureDescription != nil {
-            return """
+            ordinaryContext = Self.sessionContextText(record)
+        } else if storeFailureDescription != nil {
+            ordinaryContext = """
             A persistent task ledger exists but could not be read safely. Do not claim prior work stopped or does not exist. If the owner asks about earlier work, say you need to check its Codex task rather than answering no.
             """
+        } else {
+            ordinaryContext = "No delegated Codex task is currently recorded."
         }
-        return "No delegated Codex task is currently recorded."
+        return ordinaryContext + "\n" + Self.projectChatFocusContext(
+            projectChatFocus,
+            record: projectChatFocus?.taskID.flatMap { records[$0] }
+        )
     }
 
     func hasActiveTask() -> Bool {
         records.values.contains { !$0.status.isTerminal || $0.cancelRequested }
+    }
+
+    /// Resolves Realtime's semantic resource names to the exact host-owned
+    /// workspace/thread binding before authorization is issued. This method is
+    /// observation-only; execution later rejects the envelope if focus changed.
+    func prepareProjectChatAuthorization(
+        proposal: CodexProjectChatProposal
+    ) async -> CodexProjectChatPreparation {
+        let generation = projectChatGeneration
+        let focus = projectChatFocus
+        do {
+            let target: CodexProjectChatResolvedTarget
+            switch proposal.operation {
+            case .listProjects:
+                target = CodexProjectChatResolvedTarget(
+                    focusGeneration: generation,
+                    mode: nil,
+                    projectDisplayName: nil,
+                    workspacePath: nil,
+                    threadWorkingDirectoryPath: nil,
+                    threadDisplayName: nil,
+                    threadID: nil
+                )
+            case .focusProject:
+                guard let requested = proposal.projectName else {
+                    return .failed(projectChatFailure(.effectMismatch, "No Codex project was selected."))
+                }
+                let catalog = try await codexProjectCatalog()
+                let matches = Self.matchingProjects(requested, in: catalog)
+                guard matches.count == 1, let project = matches.first else {
+                    return .failed(projectChatFailure(
+                        matches.isEmpty ? .projectUnavailable : .ambiguousProject,
+                        matches.isEmpty
+                            ? "I couldn't find that Codex project. \(Self.projectListText(catalog))"
+                            : "That project name matches more than one workspace. \(Self.projectListText(matches))"
+                    ))
+                }
+                target = Self.projectChatTarget(
+                    generation: generation,
+                    mode: .projectSelected,
+                    project: project,
+                    thread: nil
+                )
+            case .focusChat:
+                guard let focus else {
+                    return .failed(projectChatFailure(
+                        .focusUnavailable,
+                        "Choose a Codex project before choosing one of its chats."
+                    ))
+                }
+                let project = try await freshProject(for: focus)
+                let matches = Self.matchingThreads(
+                    chatName: proposal.chatName,
+                    threadID: proposal.threadID,
+                    in: project.threads
+                )
+                guard matches.count == 1, let thread = matches.first else {
+                    return .failed(projectChatFailure(
+                        matches.isEmpty ? .chatUnavailable : .ambiguousChat,
+                        matches.isEmpty
+                            ? "I couldn't find that chat in \(project.displayName). \(Self.chatListText(project))"
+                            : "That name matches more than one chat. \(Self.threadChoicesText(matches))"
+                    ))
+                }
+                target = Self.projectChatTarget(
+                    generation: generation,
+                    mode: .threadSelected,
+                    project: project,
+                    thread: thread
+                )
+            case .prepareNewChat:
+                guard let focus else {
+                    return .failed(projectChatFailure(
+                        .focusUnavailable,
+                        "Choose a Codex project before starting a chat in it."
+                    ))
+                }
+                let project = try await freshProject(for: focus)
+                target = Self.projectChatTarget(
+                    generation: generation,
+                    mode: .newThreadPending,
+                    project: project,
+                    thread: nil
+                )
+            case .relay:
+                guard let focus else {
+                    return .failed(projectChatFailure(
+                        .focusUnavailable,
+                        "Choose a Codex project and chat before sending work there."
+                    ))
+                }
+                guard focus.mode != .projectSelected else {
+                    return .failed(projectChatFailure(
+                        .focusUnavailable,
+                        "Choose an existing chat or a new one in the selected Codex project first."
+                    ))
+                }
+                let project = try await freshProject(for: focus)
+                let thread: AuroraCodexThreadSummary?
+                if focus.mode == .threadSelected, let threadID = focus.threadID {
+                    guard let exact = project.threads.first(where: { $0.threadID == threadID }) else {
+                        return .failed(projectChatFailure(
+                            .staleTarget,
+                            "The selected Codex chat moved, was archived, or is no longer available."
+                        ))
+                    }
+                    thread = exact
+                } else {
+                    thread = nil
+                }
+                target = Self.projectChatTarget(
+                    generation: generation,
+                    mode: focus.mode,
+                    project: project,
+                    thread: thread
+                )
+            case .relayToChat:
+                guard let requested = proposal.projectName else {
+                    return .failed(projectChatFailure(.effectMismatch, "No Codex project was selected."))
+                }
+                let catalog = try await codexProjectCatalog()
+                let projects = Self.matchingProjects(requested, in: catalog)
+                guard projects.count == 1, let project = projects.first else {
+                    return .failed(projectChatFailure(
+                        projects.isEmpty ? .projectUnavailable : .ambiguousProject,
+                        "I couldn't resolve that request to one Codex project."
+                    ))
+                }
+                let chats = Self.matchingThreads(
+                    chatName: proposal.chatName,
+                    threadID: proposal.threadID,
+                    in: project.threads
+                )
+                guard chats.count == 1, let chat = chats.first else {
+                    return .failed(projectChatFailure(
+                        chats.isEmpty ? .chatUnavailable : .ambiguousChat,
+                        "I couldn't resolve that request to one Codex chat in \(project.displayName)."
+                    ))
+                }
+                target = Self.projectChatTarget(
+                    generation: generation,
+                    mode: .threadSelected,
+                    project: project,
+                    thread: chat
+                )
+            case .leaveFocus:
+                target = Self.projectChatTarget(
+                    generation: generation,
+                    focus: focus
+                )
+            case .status:
+                if let focus, focus.mode == .threadSelected,
+                   let threadID = focus.threadID {
+                    let project = try await freshProject(for: focus)
+                    guard let thread = project.threads.first(where: {
+                        $0.threadID == threadID
+                    }) else {
+                        return .failed(projectChatFailure(
+                            .staleTarget,
+                            "The selected Codex chat is no longer available in that project."
+                        ))
+                    }
+                    target = Self.projectChatTarget(
+                        generation: generation,
+                        mode: .threadSelected,
+                        project: project,
+                        thread: thread
+                    )
+                } else {
+                    target = Self.projectChatTarget(
+                        generation: generation,
+                        focus: focus
+                    )
+                }
+            }
+            guard generation == projectChatGeneration else {
+                return .failed(projectChatFailure(
+                    .staleTarget,
+                    "The selected Codex project or chat changed while that request was being resolved."
+                ))
+            }
+            return .ready(target)
+        } catch {
+            return .failed(projectChatFailure(
+                .executionFailed,
+                "I couldn't reach the Codex project catalog right now."
+            ))
+        }
+    }
+
+    /// Executes the separate, explicit Codex project/chat state machine. It
+    /// never changes the implicit target used by ordinary `delegate_task`.
+    func projectChat(
+        proposal: CodexProjectChatProposal,
+        authorization: CodexProjectChatAuthorizationEnvelope
+    ) async -> CodexProjectChatResult {
+        let scope = ProjectChatRequestScope(
+            proposal: proposal,
+            authorization: authorization
+        )
+        if let remembered = projectChatRequestResults[authorization.requestID] {
+            guard remembered.0 == scope else {
+                return projectChatFailure(
+                    .effectMismatch,
+                    "That request identity is already bound to different Codex work."
+                )
+            }
+            return Self.duplicateProjectChatResult(remembered.1)
+        }
+        if let inFlight = inFlightProjectChatRequests[authorization.requestID] {
+            guard inFlight.scope == scope else {
+                return projectChatFailure(
+                    .effectMismatch,
+                    "That request identity is already bound to different Codex work."
+                )
+            }
+            return Self.duplicateProjectChatResult(await inFlight.task.value)
+        }
+        let predecessor = projectChatDispatchTail
+        let token = UUID()
+        let task = Task {
+            if let predecessor { await predecessor.value }
+            return await self.performProjectChat(
+                proposal: proposal,
+                authorization: authorization
+            )
+        }
+        let tail = Task<Void, Never> { _ = await task.value }
+        projectChatDispatchTail = tail
+        projectChatDispatchTailToken = token
+        inFlightProjectChatRequests[authorization.requestID] = InFlightProjectChatRequest(
+            scope: scope,
+            task: task
+        )
+        let result = await task.value
+        inFlightProjectChatRequests.removeValue(forKey: authorization.requestID)
+        rememberProjectChatResult(result, scope: scope, requestID: authorization.requestID)
+        if projectChatDispatchTailToken == token {
+            projectChatDispatchTail = nil
+            projectChatDispatchTailToken = nil
+        }
+        return result
+    }
+
+    private func performProjectChat(
+        proposal: CodexProjectChatProposal,
+        authorization: CodexProjectChatAuthorizationEnvelope
+    ) async -> CodexProjectChatResult {
+        let effect = CodexProjectChatEffect(
+            proposal: proposal,
+            relayText: authorization.allowedEffect.relayText,
+            resolvedTarget: authorization.allowedEffect.resolvedTarget
+        )
+        guard authorization.allows(effect) else {
+            return projectChatFailure(
+                authorization.expiresAt < Date() ? .authorizationExpired : .effectMismatch,
+                "That Codex project request expired or changed before it could run."
+            )
+        }
+        let target = effect.resolvedTarget
+        guard target.focusGeneration == projectChatGeneration else {
+            return projectChatFailure(
+                .staleTarget,
+                "The selected Codex project or chat changed before that request could run."
+            )
+        }
+        if proposal.operation == .relay || proposal.operation == .relayToChat,
+           let prior = records.values.first(where: { record in
+               record.operationLedger.contains(where: {
+                   $0.operationID == authorization.requestID
+               })
+           }) {
+            return CodexProjectChatResult(
+                ok: true,
+                code: .duplicate,
+                detail: "That exact Codex message was already handed off; it was not sent twice.",
+                threadID: prior.codexThreadID,
+                taskID: prior.taskID,
+                backgroundTask: !prior.status.isTerminal
+            )
+        }
+        do {
+            switch proposal.operation {
+            case .listProjects:
+                let catalog = try await codexProjectCatalog()
+                guard !catalog.isEmpty else {
+                    return projectChatFailure(
+                        .projectUnavailable,
+                        "No persistent top-level Codex project chats are currently available."
+                    )
+                }
+                return CodexProjectChatResult(
+                    ok: true,
+                    code: .projectsListed,
+                    detail: Self.projectListText(catalog),
+                    threadID: nil,
+                    taskID: nil,
+                    backgroundTask: false
+                )
+
+            case .focusProject:
+                let catalog = try await codexProjectCatalog()
+                guard let workspacePath = target.workspacePath,
+                      let project = catalog.first(where: {
+                          $0.workspaceURL.standardizedFileURL.path == workspacePath
+                      }) else {
+                    return projectChatFailure(
+                        .staleTarget,
+                        "That exact Codex project is no longer available."
+                    )
+                }
+                let candidate = CodexProjectChatPersistedFocus(
+                    mode: .projectSelected,
+                    projectName: project.displayName,
+                    workspacePath: project.workspaceURL.path,
+                    threadWorkspacePath: nil,
+                    threadID: nil,
+                    threadName: nil,
+                    taskID: nil
+                )
+                guard commitProjectChatFocus(candidate, expectedGeneration: target.focusGeneration) else {
+                    return projectChatFailure(
+                        .executionFailed,
+                        "I found the project, but couldn't retain the selection safely."
+                    )
+                }
+                return CodexProjectChatResult(
+                    ok: true,
+                    code: .projectFocused,
+                    detail: Self.chatListText(project),
+                    threadID: nil,
+                    taskID: nil,
+                    backgroundTask: false
+                )
+
+            case .focusChat:
+                let catalog = try await codexProjectCatalog()
+                guard let workspacePath = target.workspacePath,
+                      let exactThreadID = target.threadID,
+                      let project = catalog.first(where: {
+                          $0.workspaceURL.standardizedFileURL.path == workspacePath
+                      }),
+                      let thread = project.threads.first(where: {
+                          $0.threadID == exactThreadID
+                      }) else {
+                    return projectChatFailure(
+                        .staleTarget,
+                        "That exact Codex chat is no longer available in the selected project."
+                    )
+                }
+                let taskID = existingTaskID(forThreadID: thread.threadID)
+                let candidate = CodexProjectChatPersistedFocus(
+                    mode: .threadSelected,
+                    projectName: project.displayName,
+                    workspacePath: project.workspaceURL.path,
+                    threadWorkspacePath: thread.workingDirectory.standardizedFileURL.path,
+                    threadID: thread.threadID,
+                    threadName: Self.threadDisplayName(thread),
+                    taskID: taskID
+                )
+                guard commitProjectChatFocus(candidate, expectedGeneration: target.focusGeneration) else {
+                    return projectChatFailure(
+                        .executionFailed,
+                        "I found the chat, but couldn't retain the selection safely."
+                    )
+                }
+                return CodexProjectChatResult(
+                    ok: true,
+                    code: .chatFocused,
+                    detail: "Selected Codex chat ‘\(Self.threadDisplayName(thread))’ in \(project.displayName). The owner's next work message will be relayed to that exact chat without an added task prompt.",
+                    threadID: thread.threadID,
+                    taskID: taskID,
+                    backgroundTask: false
+                )
+
+            case .prepareNewChat:
+                let catalog = try await codexProjectCatalog()
+                guard let workspacePath = target.workspacePath,
+                      let project = catalog.first(where: {
+                          $0.workspaceURL.standardizedFileURL.path == workspacePath
+                      }) else {
+                    return projectChatFailure(
+                        .staleTarget,
+                        "That exact Codex project is no longer available."
+                    )
+                }
+                let candidate = CodexProjectChatPersistedFocus(
+                    mode: .newThreadPending,
+                    projectName: project.displayName,
+                    workspacePath: project.workspaceURL.path,
+                    threadWorkspacePath: nil,
+                    threadID: nil,
+                    threadName: nil,
+                    taskID: nil
+                )
+                guard commitProjectChatFocus(candidate, expectedGeneration: target.focusGeneration) else {
+                    return projectChatFailure(
+                        .executionFailed,
+                        "I couldn't retain the new-chat selection safely."
+                    )
+                }
+                return CodexProjectChatResult(
+                    ok: true,
+                    code: .newChatReady,
+                    detail: "A new Codex chat is selected in \(project.displayName). It will be created when the owner gives the first work message; no empty task was created.",
+                    threadID: nil,
+                    taskID: nil,
+                    backgroundTask: false
+                )
+
+            case .relay:
+                guard let relayText = authorization.allowedEffect.relayText else {
+                    return projectChatFailure(.effectMismatch, "No finalized owner message was available.")
+                }
+                return await relayProjectChatMessage(
+                    relayText,
+                    authorization: authorization,
+                    target: target
+                )
+
+            case .relayToChat:
+                guard let relayText = authorization.allowedEffect.relayText else {
+                    return projectChatFailure(.effectMismatch, "The direct Codex relay was incomplete.")
+                }
+                return await relayProjectChatMessage(
+                    relayText,
+                    authorization: authorization,
+                    target: target
+                )
+
+            case .leaveFocus:
+                guard commitProjectChatFocus(nil, expectedGeneration: target.focusGeneration) else {
+                    return projectChatFailure(
+                        .executionFailed,
+                        "I couldn't clear the Codex chat selection safely."
+                    )
+                }
+                return CodexProjectChatResult(
+                    ok: true,
+                    code: .focusLeft,
+                    detail: "The explicit Codex project/chat focus was cleared. Ordinary requests will use Aurora's normal isolated task route.",
+                    threadID: nil,
+                    taskID: nil,
+                    backgroundTask: false
+                )
+
+            case .status:
+                guard let mode = target.mode,
+                      let projectName = target.projectDisplayName,
+                      let workspacePath = target.workspacePath else {
+                    return CodexProjectChatResult(
+                        ok: true,
+                        code: .status,
+                        detail: "No Codex project or chat is explicitly focused.",
+                        threadID: nil,
+                        taskID: nil,
+                        backgroundTask: false
+                    )
+                }
+                let project = try await codexProjectCatalog().first(where: {
+                    $0.workspaceURL.standardizedFileURL.path == workspacePath
+                })
+                guard let project else {
+                    return projectChatFailure(.staleTarget, "The selected Codex project is no longer available.")
+                }
+                if mode == .threadSelected, let threadID = target.threadID {
+                    guard let thread = project.threads.first(where: { $0.threadID == threadID }) else {
+                        return projectChatFailure(
+                            .staleTarget,
+                            "The selected Codex chat is no longer available in that project."
+                        )
+                    }
+                    let taskID = existingTaskID(forThreadID: thread.threadID)
+                    if let taskID,
+                       let threadWorkspacePath = target.threadWorkingDirectoryPath {
+                        await reconcileProjectChatRecord(
+                            taskID: taskID,
+                            expectedWorkingDirectory: URL(
+                                fileURLWithPath: threadWorkspacePath
+                            ).standardizedFileURL
+                        )
+                    }
+                    let record = taskID.flatMap { records[$0] }
+                    let statusText = record.map {
+                        "\($0.statusKnowledge == .live ? "live" : "last-known") state: \($0.status.rawValue)"
+                    } ?? "app-server state: \(thread.status)"
+                    let resultText = record?.resultSummary.map {
+                        " Latest result: \(Self.boundedNaturalResult($0, maximum: 600))"
+                    } ?? ""
+                    return CodexProjectChatResult(
+                        ok: true,
+                        code: .status,
+                        detail: "Focused Codex chat: ‘\(Self.threadDisplayName(thread))’ in \(project.displayName). Current \(statusText).\(resultText)",
+                        threadID: thread.threadID,
+                        taskID: taskID,
+                        backgroundTask: record.map { !$0.status.isTerminal }
+                            ?? (thread.status == "active")
+                    )
+                }
+                return CodexProjectChatResult(
+                    ok: true,
+                    code: .status,
+                    detail: mode == .newThreadPending
+                        ? "A new Codex chat is selected in \(project.displayName) and will be created with the next work message."
+                        : "Codex project \(projectName) is selected, but no chat has been chosen yet.",
+                    threadID: nil,
+                    taskID: nil,
+                    backgroundTask: false
+                )
+            }
+        } catch {
+            return projectChatFailure(
+                .executionFailed,
+                "I couldn't reach the Codex project catalog right now."
+            )
+        }
+    }
+
+    private func codexProjectCatalog() async throws -> [CodexProjectCatalogEntry] {
+        var cursor: String?
+        var pages = 0
+        var allThreads: [AuroraCodexThreadSummary] = []
+        repeat {
+            let page = try await runtime.listThreads(query: AuroraCodexThreadQuery(
+                cursor: cursor,
+                limit: 100,
+                archived: false
+            ))
+            allThreads.append(contentsOf: page.threads.filter {
+                !$0.ephemeral
+                    && !$0.source.lowercased().contains("subagent")
+                    && $0.source.lowercased() != "exec"
+            })
+            cursor = page.nextCursor
+            pages += 1
+        } while cursor != nil && pages < 20 && allThreads.count < 2_000
+
+        let desktopRegistry = codexDesktopRegistry()
+        let catalog: [CodexProjectCatalogEntry]
+        if let desktopRegistry, !desktopRegistry.projects.isEmpty {
+            // Mirror Desktop's current local-project rule: a task belongs to
+            // an explicit assignment first, otherwise to the project owning
+            // the longest registered root equal to, or containing, its cwd.
+            var assigned: [String: [AuroraCodexThreadSummary]] = [:]
+            for thread in allThreads {
+                let cwd = thread.workingDirectory.standardizedFileURL.path
+                if let assignment = desktopRegistry.assignments[thread.threadID],
+                   assignment.projectKind == "local",
+                   desktopRegistry.projects.contains(where: {
+                       $0.projectID == assignment.projectId
+                   }) {
+                    assigned[assignment.projectId, default: []].append(thread)
+                    continue
+                }
+                let matching = desktopRegistry.projects.flatMap { project in
+                    project.workspaceRoots.compactMap { root in
+                        Self.path(cwd, isWithin: root.path)
+                            ? (project.projectID, root.path.count)
+                            : nil
+                    }
+                }.max(by: { $0.1 < $1.1 })
+                if let projectID = matching?.0 {
+                    assigned[projectID, default: []].append(thread)
+                }
+            }
+            catalog = desktopRegistry.projects.compactMap { project in
+                guard let primaryRoot = project.workspaceRoots.first else { return nil }
+                return CodexProjectCatalogEntry(
+                    projectID: project.projectID,
+                    displayName: project.displayName,
+                    workspaceURL: primaryRoot,
+                    workspaceRoots: project.workspaceRoots,
+                    threads: assigned[project.projectID, default: []]
+                        .sorted(by: { $0.updatedAt > $1.updatedAt })
+                )
+            }
+        } else {
+            // Supported app-server currently exposes threads, not Projects.
+            // If Desktop's bounded read-only registry is unavailable, exact
+            // cwd grouping keeps existing chats usable without fabricating an
+            // assignment or mutating private UI state.
+            catalog = Dictionary(grouping: allThreads) {
+                $0.workingDirectory.standardizedFileURL.path
+            }.map { path, threads in
+                let url = URL(fileURLWithPath: path).standardizedFileURL
+                let name = url.lastPathComponent.isEmpty ? path : url.lastPathComponent
+                return CodexProjectCatalogEntry(
+                    projectID: nil,
+                    displayName: name,
+                    workspaceURL: url,
+                    workspaceRoots: [url],
+                    threads: threads.sorted(by: { $0.updatedAt > $1.updatedAt })
+                )
+            }
+        }
+        return catalog.sorted {
+            let lhs = $0.threads.first?.updatedAt ?? .distantPast
+            let rhs = $1.threads.first?.updatedAt ?? .distantPast
+            return lhs == rhs
+                ? $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+                : lhs > rhs
+        }
+    }
+
+    private func codexDesktopRegistry() -> CodexDesktopRegistry? {
+        let stateURL = homeDirectory
+            .appendingPathComponent(".codex", isDirectory: true)
+            .appendingPathComponent(".codex-global-state.json", isDirectory: false)
+            .standardizedFileURL
+        guard let values = try? stateURL.resourceValues(forKeys: [
+            .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey,
+        ]),
+        values.isRegularFile == true,
+        values.isSymbolicLink != true,
+        let size = values.fileSize,
+        size > 0,
+        size <= 4 * 1_024 * 1_024,
+        let data = try? Data(contentsOf: stateURL, options: [.mappedIfSafe]),
+        let state = try? JSONDecoder().decode(CodexDesktopGlobalState.self, from: data) else {
+            return nil
+        }
+        var projects: [CodexDesktopProject] = []
+        var seenPaths = Set<String>()
+        for (projectID, document) in state.localProjects {
+            let name = document.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty,
+                  name.count <= 240,
+                  Self.validPersistedIdentity(projectID) else { continue }
+            var roots: [URL] = []
+            for path in document.rootPaths.prefix(16) {
+                guard let workspace = try? validatedWorkspace(
+                    URL(fileURLWithPath: path).standardizedFileURL
+                ), seenPaths.insert(workspace.path).inserted else { continue }
+                roots.append(workspace)
+            }
+            guard !roots.isEmpty else { continue }
+            projects.append(CodexDesktopProject(
+                projectID: projectID,
+                displayName: name,
+                // Desktop's first registered root is the deterministic cwd
+                // for a new chat when a project has multiple roots.
+                workspaceRoots: roots
+            ))
+        }
+        projects.sort {
+            let order = $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+            return order == .orderedSame
+                ? $0.projectID < $1.projectID
+                : order == .orderedAscending
+        }
+        let validProjectIDs = Set(projects.map(\.projectID))
+        let assignments = (state.threadProjectAssignments ?? [:]).filter { threadID, value in
+            Self.validPersistedIdentity(threadID)
+                && value.projectKind == "local"
+                && validProjectIDs.contains(value.projectId)
+                && value.path.map({ $0.count <= 4_096 }) ?? true
+                && value.cwd.map({ $0.count <= 4_096 }) ?? true
+        }
+        return CodexDesktopRegistry(projects: projects, assignments: assignments)
+    }
+
+    private static func path(_ candidate: String, isWithin root: String) -> Bool {
+        candidate == root || candidate.hasPrefix(root + "/")
+    }
+
+    private static func projectChatTarget(
+        generation: UInt64,
+        mode: CodexProjectChatFocusMode,
+        project: CodexProjectCatalogEntry,
+        thread: AuroraCodexThreadSummary?
+    ) -> CodexProjectChatResolvedTarget {
+        CodexProjectChatResolvedTarget(
+            focusGeneration: generation,
+            mode: mode,
+            projectDisplayName: project.displayName,
+            workspacePath: project.workspaceURL.standardizedFileURL.path,
+            threadWorkingDirectoryPath: thread?.workingDirectory.standardizedFileURL.path,
+            threadDisplayName: thread.map(Self.threadDisplayName),
+            threadID: thread?.threadID
+        )
+    }
+
+    private static func projectChatTarget(
+        generation: UInt64,
+        focus: CodexProjectChatPersistedFocus?
+    ) -> CodexProjectChatResolvedTarget {
+        CodexProjectChatResolvedTarget(
+            focusGeneration: generation,
+            mode: focus?.mode,
+            projectDisplayName: focus?.projectName,
+            workspacePath: focus?.workspacePath,
+            threadWorkingDirectoryPath: focus?.threadWorkspacePath,
+            threadDisplayName: focus?.threadName,
+            threadID: focus?.threadID
+        )
+    }
+
+    private func freshProject(
+        for focus: CodexProjectChatPersistedFocus
+    ) async throws -> CodexProjectCatalogEntry {
+        let path = URL(fileURLWithPath: focus.workspacePath).standardizedFileURL.path
+        guard let project = try await codexProjectCatalog().first(where: {
+            $0.workspaceURL.standardizedFileURL.path == path
+        }) else {
+            throw CodexTaskRuntimeError.taskNotFound
+        }
+        return project
+    }
+
+    private func relayProjectChatMessage(
+        _ message: String,
+        authorization: CodexProjectChatAuthorizationEnvelope,
+        target: CodexProjectChatResolvedTarget
+    ) async -> CodexProjectChatResult {
+        guard authorization.isActiveForProjectChat,
+              target.focusGeneration == projectChatGeneration,
+              let projectName = target.projectDisplayName,
+              let projectRootPath = target.workspacePath,
+              let mode = target.mode,
+              mode == .threadSelected || mode == .newThreadPending else {
+            return projectChatFailure(
+                .staleTarget,
+                "The selected Codex project or chat changed before dispatch."
+            )
+        }
+        let projectRootURL: URL
+        let executionWorkspaceURL: URL
+        do {
+            projectRootURL = try validatedWorkspace(URL(fileURLWithPath: projectRootPath))
+            executionWorkspaceURL = try validatedWorkspace(URL(
+                fileURLWithPath: target.threadWorkingDirectoryPath ?? projectRootPath
+            ))
+        } catch {
+            return projectChatFailure(
+                .staleTarget,
+                "The selected Codex project workspace is no longer available."
+            )
+        }
+        let existingThreadID = target.threadID
+        if let existingThreadID {
+            do {
+                guard let project = try await codexProjectCatalog().first(where: {
+                    $0.workspaceURL.standardizedFileURL.path == projectRootURL.path
+                }) else {
+                    throw CodexTaskRuntimeError.taskNotFound
+                }
+                guard project.threads.contains(where: {
+                    $0.threadID == existingThreadID
+                        && $0.workingDirectory.standardizedFileURL.path
+                            == executionWorkspaceURL.path
+                        && !$0.ephemeral
+                }) else {
+                    return projectChatFailure(
+                        .staleTarget,
+                        "The selected Codex chat moved, was archived, or is no longer available."
+                    )
+                }
+            } catch {
+                return projectChatFailure(
+                    .staleTarget,
+                    "The selected Codex chat could not be revalidated before sending."
+                )
+            }
+        }
+
+        do {
+            guard try await supportsPersistentRuntimeWithOneSafeReconnect() else {
+                return projectChatFailure(
+                    .executionFailed,
+                    "The shared Codex runtime isn't available, so I didn't send the message."
+                )
+            }
+        } catch {
+            return projectChatFailure(
+                .executionFailed,
+                "I couldn't establish the persistent Codex connection, so I didn't send the message."
+            )
+        }
+        await ensureRuntimeHandler()
+        guard authorization.isActiveForProjectChat,
+              target.focusGeneration == projectChatGeneration else {
+            return projectChatFailure(
+                authorization.expiresAt < Date() ? .authorizationExpired : .staleTarget,
+                "That Codex message expired or the selected chat changed before dispatch."
+            )
+        }
+
+        let now = Date()
+        let existingRecord = existingThreadID
+            .flatMap(existingRecordForThreadID)
+        let taskID = existingRecord?.taskID
+            ?? "codex_project_" + UUID().uuidString.lowercased()
+        var record: Record
+        if var current = existingRecord {
+            current.revision += 1
+            current.sourceTurnIDs = Array(
+                (current.sourceTurnIDs + [authorization.sourceTurnID]).suffix(16)
+            )
+            current.updatedAt = now
+            current.status = .running
+            current.statusKnowledge = .live
+            current.resultSummary = nil
+            current.resultReport = nil
+            current.effectVerified = false
+            Self.appendAuthorizedLedgerEntry(
+                to: &current,
+                operationID: authorization.requestID,
+                operation: .update,
+                revision: current.revision,
+                authorizationID: authorization.authorizationID,
+                sourceTurnIDs: current.sourceTurnIDs,
+                authorizedEffect: message,
+                recordedAt: now
+            )
+            record = current
+        } else {
+            record = Record(
+                taskID: taskID,
+                codexThreadID: existingThreadID,
+                codexTurnID: nil,
+                sessionID: authorization.sessionID,
+                taskKind: .general,
+                executionClass: .project,
+                rootAuthorizationID: authorization.authorizationID,
+                sourceTurnIDs: [authorization.sourceTurnID],
+                goal: message,
+                successCriteria: nil,
+                workspaceURL: executionWorkspaceURL,
+                createdAt: now,
+                updatedAt: now,
+                status: .queued,
+                statusKnowledge: .live,
+                revision: 1,
+                resultSummary: nil,
+                resultReport: nil,
+                effectVerified: false,
+                stepCount: 0,
+                operationLedger: [Self.authorizedLedgerEntry(
+                    sequence: 1,
+                    operationID: authorization.requestID,
+                    operation: .start,
+                    revision: 1,
+                    authorizationID: authorization.authorizationID,
+                    sourceTurnIDs: [authorization.sourceTurnID],
+                    authorizedEffect: message,
+                    recordedAt: now
+                )],
+                effectReportingContractVersion: nil,
+                cancelRequested: false,
+                lastProgressEmissionAt: nil,
+                isProjectChat: true
+            )
+        }
+        let previousRecord = records[taskID]
+        let previousFocus = projectChatFocus
+        let previousGeneration = projectChatGeneration
+        records[taskID] = record
+        let selectedFocus = CodexProjectChatPersistedFocus(
+            mode: mode,
+            projectName: projectName,
+            workspacePath: projectRootURL.path,
+            threadWorkspacePath: target.threadWorkingDirectoryPath,
+            threadID: existingThreadID,
+            threadName: target.threadDisplayName,
+            taskID: taskID
+        )
+        if !Self.sameProjectChatRouting(projectChatFocus, selectedFocus) {
+            projectChatGeneration &+= 1
+        }
+        projectChatFocus = selectedFocus
+        guard persistState() else {
+            if let previousRecord {
+                records[taskID] = previousRecord
+            } else {
+                records.removeValue(forKey: taskID)
+            }
+            projectChatFocus = previousFocus
+            projectChatGeneration = previousGeneration
+            return projectChatFailure(
+                .executionFailed,
+                "The exact Codex chat handoff couldn't be recorded safely, so it was not sent."
+            )
+        }
+        emit(existingRecord == nil ? .started : .updated, record: record)
+
+        do {
+            let handle: CodexTaskHandle
+            if let existingThreadID {
+                handle = try await runtime.sendExactMessage(
+                    taskID: taskID,
+                    threadID: existingThreadID,
+                    input: message,
+                    expectedWorkingDirectory: executionWorkspaceURL
+                )
+            } else {
+                handle = try await runtime.startRawProjectThread(
+                    taskID: taskID,
+                    input: message,
+                    options: projectChatOptions(workspaceURL: projectRootURL)
+                )
+            }
+            guard var accepted = records[taskID] else {
+                return projectChatFailure(
+                    .executionFailed,
+                    "Codex accepted the message, but its durable binding was lost."
+                )
+            }
+            let terminalEventAlreadyWon = accepted.status.isTerminal
+                && accepted.codexThreadID == handle.threadID
+                && accepted.codexTurnID == handle.turnID
+            accepted.codexThreadID = handle.threadID
+            accepted.codexTurnID = handle.turnID
+            if !terminalEventAlreadyWon {
+                accepted.status = .running
+                accepted.statusKnowledge = .live
+            }
+            accepted.updatedAt = Date()
+            if let operationID = Self.latestAuthorizedOperationID(in: accepted) {
+                Self.appendLedgerEntry(
+                    to: &accepted,
+                    operationID: operationID,
+                    event: .executorBound,
+                    codexTurnID: handle.turnID,
+                    recordedAt: accepted.updatedAt
+                )
+            }
+            records[taskID] = accepted
+            let acceptedFocus = CodexProjectChatPersistedFocus(
+                mode: .threadSelected,
+                projectName: projectName,
+                workspacePath: projectRootURL.path,
+                threadWorkspacePath: existingThreadID == nil
+                    ? projectRootURL.path
+                    : executionWorkspaceURL.path,
+                threadID: handle.threadID,
+                threadName: target.threadDisplayName,
+                taskID: taskID
+            )
+            if !Self.sameProjectChatRouting(projectChatFocus, acceptedFocus) {
+                projectChatGeneration &+= 1
+            }
+            projectChatFocus = acceptedFocus
+            let retained = persistState()
+            let runtime = self.runtime
+            Task { _ = await runtime.openThreadInDesktop(threadID: handle.threadID) }
+            return CodexProjectChatResult(
+                ok: true,
+                code: .accepted,
+                detail: retained
+                    ? "The owner's message was sent to the selected persistent Codex chat."
+                    : "The owner's message was sent, but its local continuity record could not be saved to disk.",
+                threadID: handle.threadID,
+                taskID: taskID,
+                backgroundTask: true
+            )
+        } catch {
+            let acceptanceUnknown = Self.isAmbiguousProjectChatDispatchFailure(error)
+            if var failed = records[taskID] {
+                let summary = acceptanceUnknown
+                    ? "The Codex connection changed before message acceptance could be confirmed."
+                    : "Codex rejected the project-chat message."
+                if !acceptanceUnknown,
+                   let operationID = Self.latestAuthorizedOperationID(in: failed) {
+                    Self.appendLedgerEntry(
+                        to: &failed,
+                        operationID: operationID,
+                        event: .failed,
+                        codexTurnID: failed.codexTurnID,
+                        executorStatus: .failed,
+                        resultSummary: summary,
+                        recordedAt: Date()
+                    )
+                }
+                if acceptanceUnknown {
+                    failed.status = .running
+                    failed.statusKnowledge = .lastKnown
+                    failed.resultSummary = summary
+                } else {
+                    Self.projectLatestTerminalTruth(into: &failed)
+                    failed.statusKnowledge = .live
+                }
+                failed.updatedAt = Date()
+                records[taskID] = failed
+                persistState()
+                emit(acceptanceUnknown ? .progress : .failed, record: failed)
+            }
+            if acceptanceUnknown {
+                return projectChatFailure(
+                    .acceptanceUnknown,
+                    "The Codex connection changed while sending, so I can't safely resend or claim it was rejected."
+                )
+            }
+            return projectChatFailure(
+                .executionFailed,
+                "Codex rejected that message, so it was not treated as accepted."
+            )
+        }
+    }
+
+    private func projectChatOptions(workspaceURL: URL) -> CodexTaskThreadOptions {
+        CodexTaskThreadOptions(
+            model: nil,
+            reasoningEffort: nil,
+            workingDirectory: workspaceURL,
+            approvalPolicy: .never,
+            sandboxMode: .dangerFullAccess,
+            developerInstructions: nil,
+            dynamicTools: [],
+            threadName: nil,
+            ephemeral: false,
+            requiresDetachedPersistence: true
+        )
+    }
+
+    private func projectChatFailure(
+        _ code: CodexProjectChatResultCode,
+        _ detail: String
+    ) -> CodexProjectChatResult {
+        CodexProjectChatResult(
+            ok: false,
+            code: code,
+            detail: detail,
+            threadID: nil,
+            taskID: nil,
+            backgroundTask: false
+        )
+    }
+
+    private func existingRecordForThreadID(_ threadID: String) -> Record? {
+        records.values
+            .filter { $0.codexThreadID == threadID }
+            .max(by: { $0.updatedAt < $1.updatedAt })
+    }
+
+    private func existingTaskID(forThreadID threadID: String) -> String? {
+        existingRecordForThreadID(threadID)?.taskID
+    }
+
+    private func commitProjectChatFocus(
+        _ candidate: CodexProjectChatPersistedFocus?,
+        expectedGeneration: UInt64
+    ) -> Bool {
+        guard projectChatGeneration == expectedGeneration else { return false }
+        let prior = projectChatFocus
+        let priorGeneration = projectChatGeneration
+        if !Self.sameProjectChatRouting(prior, candidate) {
+            projectChatGeneration &+= 1
+        }
+        projectChatFocus = candidate
+        guard persistState() else {
+            projectChatFocus = prior
+            projectChatGeneration = priorGeneration
+            return false
+        }
+        return true
+    }
+
+    private static func sameProjectChatRouting(
+        _ lhs: CodexProjectChatPersistedFocus?,
+        _ rhs: CodexProjectChatPersistedFocus?
+    ) -> Bool {
+        lhs?.mode == rhs?.mode
+            && lhs?.workspacePath == rhs?.workspacePath
+            && lhs?.threadWorkspacePath == rhs?.threadWorkspacePath
+            && lhs?.threadID == rhs?.threadID
+    }
+
+    private static func duplicateProjectChatResult(
+        _ prior: CodexProjectChatResult
+    ) -> CodexProjectChatResult {
+        CodexProjectChatResult(
+            ok: prior.ok,
+            code: .duplicate,
+            detail: prior.ok
+                ? "That exact Codex project/chat request already ran; it was not repeated."
+                : prior.detail,
+            threadID: prior.threadID,
+            taskID: prior.taskID,
+            backgroundTask: prior.backgroundTask
+        )
+    }
+
+    private func rememberProjectChatResult(
+        _ result: CodexProjectChatResult,
+        scope: ProjectChatRequestScope,
+        requestID: String
+    ) {
+        if projectChatRequestResults[requestID] == nil {
+            projectChatRequestOrder.append(requestID)
+        }
+        projectChatRequestResults[requestID] = (scope, result)
+        while projectChatRequestOrder.count > 128 {
+            let evicted = projectChatRequestOrder.removeFirst()
+            projectChatRequestResults.removeValue(forKey: evicted)
+        }
+    }
+
+    private static func isAmbiguousProjectChatDispatchFailure(_ error: Error) -> Bool {
+        guard let runtimeError = error as? CodexTaskRuntimeError else { return true }
+        switch runtimeError {
+        case .transportFailure, .processTerminated, .requestTimedOut,
+             .requestCancelled, .processUnavailable:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func matchingProjects(
+        _ requested: String,
+        in catalog: [CodexProjectCatalogEntry]
+    ) -> [CodexProjectCatalogEntry] {
+        let needle = normalizedResourceName(requested)
+        let exact = catalog.filter {
+            normalizedResourceName($0.displayName) == needle
+                || normalizedResourceName($0.workspaceURL.lastPathComponent) == needle
+                || normalizedResourceName($0.workspaceURL.path) == needle
+                || $0.workspaceRoots.contains(where: {
+                    normalizedResourceName($0.lastPathComponent) == needle
+                        || normalizedResourceName($0.path) == needle
+                })
+        }
+        if !exact.isEmpty { return exact }
+        return catalog.filter {
+            normalizedResourceName($0.displayName).contains(needle)
+                || normalizedResourceName($0.workspaceURL.path).contains(needle)
+                || $0.workspaceRoots.contains(where: {
+                    normalizedResourceName($0.path).contains(needle)
+                })
+        }
+    }
+
+    private static func matchingThreads(
+        chatName: String?,
+        threadID: String?,
+        in threads: [AuroraCodexThreadSummary]
+    ) -> [AuroraCodexThreadSummary] {
+        if let threadID {
+            return threads.filter { $0.threadID == threadID }
+        }
+        guard let chatName else { return [] }
+        let needle = normalizedResourceName(chatName)
+        let exact = threads.filter {
+            normalizedResourceName(threadDisplayName($0)) == needle
+        }
+        if !exact.isEmpty { return exact }
+        return threads.filter {
+            normalizedResourceName(threadDisplayName($0)).contains(needle)
+        }
+    }
+
+    private static func normalizedResourceName(_ value: String) -> String {
+        value.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: .current
+        )
+        .split(whereSeparator: { $0.isWhitespace })
+        .joined(separator: " ")
+    }
+
+    private static func threadDisplayName(_ thread: AuroraCodexThreadSummary) -> String {
+        if let name = thread.name?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !name.isEmpty {
+            return String(name.prefix(180))
+        }
+        let firstLine = thread.preview.split(whereSeparator: { $0.isNewline }).first
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return firstLine?.isEmpty == false
+            ? String(firstLine!.prefix(180))
+            : "Untitled Codex chat"
+    }
+
+    private static func projectListText(
+        _ projects: [CodexProjectCatalogEntry]
+    ) -> String {
+        let lines = projects.prefix(20).map {
+            "- \($0.displayName) [workspace=\($0.workspaceURL.path), chats=\($0.threads.count)]"
+        }
+        return "Available Codex projects (private resource choices; do not recite workspace paths):\n"
+            + lines.joined(separator: "\n")
+    }
+
+    private static func chatListText(_ project: CodexProjectCatalogEntry) -> String {
+        "Selected Codex project \(project.displayName). "
+            + threadChoicesText(project.threads)
+            + " Ask naturally whether the owner wants one of these chats or a new chat. Never speak thread IDs."
+    }
+
+    private static func threadChoicesText(
+        _ threads: [AuroraCodexThreadSummary]
+    ) -> String {
+        guard !threads.isEmpty else {
+            return "It has no existing persistent chats; offer to start a new one."
+        }
+        let lines = threads.prefix(20).map {
+            "- ‘\(threadDisplayName($0))’ [thread_id=\($0.threadID), state=\($0.status)]"
+        }
+        return "Available chats (private exact IDs; speak names only):\n"
+            + lines.joined(separator: "\n")
+    }
+
+    private static func validProjectChatFocus(
+        _ focus: CodexProjectChatPersistedFocus,
+        homeDirectory: URL
+    ) -> Bool {
+        let home = homeDirectory.resolvingSymlinksInPath().path
+        let workspace = URL(fileURLWithPath: focus.workspacePath)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        guard workspace == home || workspace.hasPrefix(home + "/"),
+              !focus.projectName.isEmpty,
+              focus.projectName.count <= 520,
+              focus.workspacePath.count <= 4_096 else { return false }
+        if let threadWorkspacePath = focus.threadWorkspacePath {
+            let threadWorkspace = URL(fileURLWithPath: threadWorkspacePath)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+            guard (threadWorkspace == home || threadWorkspace.hasPrefix(home + "/")),
+                  threadWorkspacePath.count <= 4_096 else { return false }
+        }
+        let validTaskID = focus.taskID.map(validPersistedIdentity) ?? true
+        guard validTaskID else { return false }
+        switch focus.mode {
+        case .projectSelected:
+            return focus.threadWorkspacePath == nil
+                && focus.threadID == nil
+                && focus.taskID == nil
+        case .newThreadPending:
+            return focus.threadWorkspacePath == nil && focus.threadID == nil
+        case .threadSelected:
+            guard let threadID = focus.threadID,
+                  UUID(uuidString: threadID) != nil else { return false }
+            return true
+        }
     }
 
     func authorizationBinding(sessionID: String?) -> DelegateTaskAuthorizationBinding? {
@@ -469,9 +1910,50 @@ actor DelegateTaskCoordinator {
         proposal: DelegateTaskProposal,
         authorization: DelegateTaskAuthorizationEnvelope
     ) async -> DelegateTaskCoordinatorResult {
+        let authorizationScope = StartAuthorizationScope(authorization)
         if let duplicate = requestResults[authorization.requestID] {
+            guard startRequestScopes[authorization.requestID] == authorizationScope,
+                  authorization.isActive() else {
+                return failure(
+                    .effectMismatch,
+                    "That request identity is already bound to different authorized work."
+                )
+            }
             return duplicateWithCode(duplicate)
         }
+        if let inFlight = inFlightStartRequests[authorization.requestID] {
+            guard inFlight.proposal == proposal,
+                  inFlight.authorizationScope == authorizationScope,
+                  authorization.isActive() else {
+                return failure(
+                    .effectMismatch,
+                    "That request identity is already bound to different authorized work."
+                )
+            }
+            return duplicateWithCode(await inFlight.task.value)
+        }
+        let requestID = authorization.requestID
+        startRequestScopes[requestID] = authorizationScope
+        let inFlight = Task {
+            await self.performStart(
+                proposal: proposal,
+                authorization: authorization
+            )
+        }
+        inFlightStartRequests[requestID] = InFlightStartRequest(
+            proposal: proposal,
+            authorizationScope: authorizationScope,
+            task: inFlight
+        )
+        let result = await inFlight.value
+        inFlightStartRequests.removeValue(forKey: requestID)
+        return result
+    }
+
+    private func performStart(
+        proposal: DelegateTaskProposal,
+        authorization: DelegateTaskAuthorizationEnvelope
+    ) async -> DelegateTaskCoordinatorResult {
         let effect = DelegateTaskEffect(proposal: proposal)
         guard authorization.allows(effect: effect, activeTaskBinding: nil) else {
             return remember(DelegateTaskCoordinatorResult(
@@ -565,7 +2047,8 @@ actor DelegateTaskCoordinator {
                 authorizedEffect: goal,
                 recordedAt: now
             )],
-            effectReportingContractVersion: 1
+            effectReportingContractVersion: 1,
+            isProjectChat: false
         )
         records[taskID] = record
         latestTaskBySession[authorization.sessionID] = taskID
@@ -579,18 +2062,54 @@ actor DelegateTaskCoordinator {
         }
         await ensureRuntimeHandler()
 
-        let accepted = DelegateTaskCoordinatorResult(
-            ok: true,
-            code: .accepted,
-            snapshot: snapshot(record),
-            detail: "The task was accepted and will continue in the background."
-        )
-        _ = remember(accepted, requestID: authorization.requestID)
         emit(.started, record: record)
-        launchTasks[taskID] = Task { [weak self] in
+        let launchTask = Task { [weak self] in
             guard let self else { return }
             await self.launch(taskID: taskID)
         }
+        launchTasks[taskID] = launchTask
+        // A durable local queue entry is necessary but not sufficient for an
+        // audible acceptance. Wait only for app-server thread/start and
+        // turn/start to return their exact handles; Codex work itself remains
+        // fully backgrounded after this short binding boundary.
+        await launchTask.value
+        guard let launched = records[taskID],
+              launched.codexThreadID != nil,
+              launched.codexTurnID != nil,
+              !launched.cancelRequested,
+              launched.status != .failed,
+              launched.status != .cancelled else {
+            let detail = records[taskID]?.resultSummary
+                ?? "Codex did not accept the task, so no work was started."
+            return remember(failure(.executionFailed, detail),
+                            requestID: authorization.requestID)
+        }
+        guard persistState() else {
+            if var untracked = records[taskID], !untracked.status.isTerminal {
+                untracked.cancelRequested = true
+                untracked.statusKnowledge = .lastKnown
+                untracked.resultSummary = "The Codex turn started, but Aurora could not retain its durable binding."
+                untracked.updatedAt = Date()
+                records[taskID] = untracked
+                Task { [weak self] in
+                    await self?.cancelAndDrain(
+                        taskID: taskID,
+                        reason: "Durable task binding could not be retained."
+                    )
+                }
+            }
+            return remember(failure(
+                .executionFailed,
+                "The Codex turn could not be recorded durably, so Aurora did not accept it as background work."
+            ), requestID: authorization.requestID)
+        }
+        let accepted = DelegateTaskCoordinatorResult(
+            ok: true,
+            code: .accepted,
+            snapshot: snapshot(launched),
+            detail: "The Codex task is running in its persistent thread."
+        )
+        _ = remember(accepted, requestID: authorization.requestID)
         return accepted
     }
 
@@ -835,6 +2354,8 @@ actor DelegateTaskCoordinator {
     /// disappeared merely because its original session identifier changed.
     func sessionContext(sessionID: String) async -> String {
         await ensureRuntimeHandler()
+        var ordinaryContext: String?
+        var reconciledOrdinaryTaskID: String?
         if let taskID = latestTaskBySession[sessionID] ?? latestPersistentTaskID() {
             latestTaskBySession[sessionID] = taskID
             if records[taskID]?.cancelRequested == true {
@@ -842,16 +2363,33 @@ actor DelegateTaskCoordinator {
             } else {
                 await reconcileRecord(taskID: taskID)
             }
+            reconciledOrdinaryTaskID = taskID
             if let record = records[taskID] {
-                return Self.sessionContextText(record)
+                ordinaryContext = Self.sessionContextText(record)
             }
         }
-        if storeFailureDescription != nil {
-            return """
+        if ordinaryContext == nil, storeFailureDescription != nil {
+            ordinaryContext = """
             A persistent task ledger exists but could not be read safely. Do not claim prior work stopped or does not exist. If the owner asks about earlier work, say you need to check its Codex task rather than answering no.
             """
         }
-        return "No delegated Codex task is currently recorded."
+        if let focus = projectChatFocus,
+           focus.mode == .threadSelected,
+           let taskID = focus.taskID,
+           taskID != reconciledOrdinaryTaskID,
+           let threadWorkspacePath = focus.threadWorkspacePath {
+            await reconcileProjectChatRecord(
+                taskID: taskID,
+                expectedWorkingDirectory: URL(fileURLWithPath: threadWorkspacePath)
+                    .standardizedFileURL
+            )
+        }
+        let focusedRecord = projectChatFocus?.taskID.flatMap { records[$0] }
+        return (ordinaryContext ?? "No delegated Codex task is currently recorded.")
+            + "\n" + Self.projectChatFocusContext(
+                projectChatFocus,
+                record: focusedRecord
+            )
     }
 
     func cancelActiveAndWait(matchingSessionID sessionID: String) async {
@@ -1496,8 +3034,11 @@ actor DelegateTaskCoordinator {
     private func latestPersistentTaskID() -> String? {
         records.values
             .filter {
-                $0.taskKind.continuesAfterVoiceRest
-                    || ($0.cancelRequested && !$0.status.isTerminal)
+                !$0.isProjectChat
+                    && (
+                        $0.taskKind.continuesAfterVoiceRest
+                            || ($0.cancelRequested && !$0.status.isTerminal)
+                    )
             }
             .max(by: { lhs, rhs in
                 let lhsCancellationPending = lhs.cancelRequested && !lhs.status.isTerminal
@@ -1669,6 +3210,94 @@ actor DelegateTaskCoordinator {
         }
     }
 
+    /// Reconciles an explicitly selected Codex chat without applying Aurora's
+    /// delegated-task model, sandbox, approval, tool, or developer settings.
+    private func reconcileProjectChatRecord(
+        taskID: String,
+        expectedWorkingDirectory: URL
+    ) async {
+        guard let original = records[taskID],
+              let threadID = original.codexThreadID else { return }
+        do {
+            let observation = try await runtime.reconcileExactProjectThread(
+                taskID: taskID,
+                threadID: threadID,
+                expectedWorkingDirectory: expectedWorkingDirectory
+            )
+            guard observation.threadID == threadID,
+                  var record = records[taskID] else { return }
+            let priorStatus = record.status
+            let turnChanged = observation.latestTurnID.map {
+                $0 != record.codexTurnID
+            } ?? false
+            if turnChanged {
+                record.resultSummary = nil
+                record.resultReport = nil
+                record.effectVerified = false
+                record.stepCount = 0
+            }
+            record.codexTurnID = observation.latestTurnID ?? record.codexTurnID
+            if let observedStatus = observation.status {
+                record.statusKnowledge = .live
+                switch observedStatus {
+                case .running: record.status = .running
+                case .completed: record.status = .completed
+                case .failed: record.status = .failed
+                case .cancelled: record.status = .cancelled
+                }
+                if record.status.isTerminal {
+                    record.resultSummary = observation.resultSummary.map {
+                        Self.boundedNaturalResult($0, maximum: 1_200)
+                    }
+                    record.resultReport = nil
+                    record.cancelRequested = false
+                    if let operationID = Self.latestAuthorizedOperationID(in: record),
+                       !Self.hasTerminalLedgerEntry(
+                           in: record,
+                           operationID: operationID,
+                           codexTurnID: record.codexTurnID,
+                           status: record.status
+                       ) {
+                        Self.appendLedgerEntry(
+                            to: &record,
+                            operationID: operationID,
+                            event: Self.ledgerEvent(for: record.status),
+                            codexTurnID: record.codexTurnID,
+                            executorStatus: record.status,
+                            resultSummary: record.resultSummary,
+                            recordedAt: Date()
+                        )
+                    }
+                    Self.projectLatestTerminalTruth(into: &record)
+                } else {
+                    record.resultSummary = nil
+                    record.resultReport = nil
+                }
+            } else {
+                record.statusKnowledge = .lastKnown
+            }
+            record.updatedAt = Date()
+            records[taskID] = record
+            persistState()
+            if !priorStatus.isTerminal, record.status.isTerminal {
+                emit(
+                    record.status == .completed
+                        ? .completed
+                        : (record.status == .cancelled ? .cancelled : .failed),
+                    record: record
+                )
+            } else if priorStatus != record.status, !record.status.isTerminal {
+                emit(.progress, record: record)
+            }
+        } catch {
+            guard var record = records[taskID] else { return }
+            record.statusKnowledge = .lastKnown
+            record.updatedAt = Date()
+            records[taskID] = record
+            persistState()
+        }
+    }
+
     @discardableResult
     private func persistState() -> Bool {
         guard let store else { return true }
@@ -1678,7 +3307,11 @@ actor DelegateTaskCoordinator {
             .prefix(128)
             .map(Self.persistedRecord)
         do {
-            try store.save(DelegateTaskPersistedState(records: Array(retained)))
+            try store.save(DelegateTaskPersistedState(
+                records: Array(retained),
+                projectChatFocus: projectChatFocus,
+                projectChatGeneration: projectChatGeneration
+            ))
             return true
         } catch {
             // Disable writes for this process. In particular, never follow a
@@ -1712,7 +3345,8 @@ actor DelegateTaskCoordinator {
             stepCount: record.stepCount,
             cancellationPending: record.cancelRequested,
             operationLedger: record.operationLedger,
-            effectReportingContractVersion: record.effectReportingContractVersion
+            effectReportingContractVersion: record.effectReportingContractVersion,
+            isProjectChat: record.isProjectChat
         )
     }
 
@@ -1770,7 +3404,8 @@ actor DelegateTaskCoordinator {
                     persisted.cancellationPending == true
                         || persisted.taskKind == .computer
                 ),
-            lastProgressEmissionAt: nil
+            lastProgressEmissionAt: nil,
+            isProjectChat: persisted.isProjectChat == true
         )
         if !restored.operationLedger.isEmpty {
             projectLatestTerminalTruth(into: &restored)
@@ -1887,6 +3522,36 @@ actor DelegateTaskCoordinator {
         """
     }
 
+    private static func projectChatFocusContext(
+        _ focus: CodexProjectChatPersistedFocus?,
+        record: Record?
+    ) -> String {
+        guard let focus else {
+            return "No explicit Codex project/chat focus is selected. Ordinary requests use delegate_task unchanged."
+        }
+        switch focus.mode {
+        case .projectSelected:
+            return "Explicit Codex project focus: \(boundedOneLine(focus.projectName, maximum: 220)). No chat is selected. Use codex_project_chat to choose an existing chat or prepare a new one; do not use delegate_task for project navigation."
+        case .newThreadPending:
+            return "Explicit Codex focus: a new chat is pending in \(boundedOneLine(focus.projectName, maximum: 220)). The next owner work message for this focus must use codex_project_chat relay, which forwards the finalized transcript exactly. Ordinary unrelated requests still use delegate_task."
+        case .threadSelected:
+            let chat = boundedOneLine(
+                focus.threadName ?? "selected chat",
+                maximum: 220
+            )
+            let work: String
+            if let record {
+                let result = record.resultSummary.map {
+                    " Latest private result: \(boundedNaturalResult($0, maximum: 320))"
+                } ?? ""
+                work = " Its \(record.statusKnowledge == .live ? "live" : "last-known") work state is \(record.status.rawValue).\(result)"
+            } else {
+                work = ""
+            }
+            return "Explicit Codex focus: chat ‘\(chat)’ in \(boundedOneLine(focus.projectName, maximum: 220)).\(work) While the owner is working in this selected chat, relay each work message through codex_project_chat relay exactly; do not wrap, summarize, or reroute it through delegate_task. Unrelated ordinary tasks remain on delegate_task."
+        }
+    }
+
     private func snapshot(_ record: Record) -> DelegateTaskSnapshot {
         DelegateTaskSnapshot(
             taskID: record.taskID,
@@ -1912,6 +3577,11 @@ actor DelegateTaskCoordinator {
     }
 
     private func options(for record: Record) -> CodexTaskThreadOptions {
+        if record.isProjectChat {
+            return projectChatOptions(
+                workspaceURL: record.workspaceURL ?? defaultProjectDirectory
+            )
+        }
         let effectReportingContractEnabled =
             record.effectReportingContractVersion == 1
         return CodexTaskThreadOptions(
@@ -2039,6 +3709,7 @@ actor DelegateTaskCoordinator {
         if requestOrder.count > 256 {
             for expired in requestOrder.prefix(requestOrder.count - 192) {
                 requestResults.removeValue(forKey: expired)
+                startRequestScopes.removeValue(forKey: expired)
             }
             requestOrder = Array(requestOrder.suffix(192))
         }
@@ -2305,6 +3976,7 @@ actor DelegateTaskCoordinator {
             authorizedEffect: authorizedEffect,
             recordedAt: recordedAt
         ))
+        compactOperationLedgerIfNeeded(&record)
     }
 
     private static func appendLedgerEntry(
@@ -2337,6 +4009,7 @@ actor DelegateTaskCoordinator {
             },
             recordedAt: recordedAt
         ))
+        compactOperationLedgerIfNeeded(&record)
     }
 
     private static func appendEffectReceipt(
@@ -2364,6 +4037,29 @@ actor DelegateTaskCoordinator {
 
     private static func nextLedgerSequence(in record: Record) -> UInt64 {
         (record.operationLedger.last?.sequence ?? 0) &+ 1
+    }
+
+    /// Keep complete recent operation groups so a long-lived selected chat
+    /// cannot eventually exceed the schema/store boundary. Sequence numbers
+    /// remain monotonic even when old groups are discarded.
+    private static func compactOperationLedgerIfNeeded(_ record: inout Record) {
+        guard record.operationLedger.count > 384 else { return }
+        var selected = Set<String>()
+        var retainedCount = 0
+        let grouped = Dictionary(grouping: record.operationLedger, by: \.operationID)
+        for entry in record.operationLedger.reversed() {
+            guard !selected.contains(entry.operationID) else { continue }
+            let count = grouped[entry.operationID]?.count ?? 0
+            if retainedCount > 0, retainedCount + count > 256 { break }
+            selected.insert(entry.operationID)
+            retainedCount += count
+        }
+        record.operationLedger = record.operationLedger.filter {
+            selected.contains($0.operationID)
+        }
+        if record.operationLedger.count > 256 {
+            record.operationLedger = Array(record.operationLedger.suffix(256))
+        }
     }
 
     private static func latestAuthorizedOperationID(in record: Record) -> String? {

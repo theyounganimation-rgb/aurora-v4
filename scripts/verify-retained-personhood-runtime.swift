@@ -7,6 +7,7 @@ import Foundation
 enum RealtimeToolContinuation: Equatable {
     case speak
     case delegateAccepted
+    case delegateRetry
     case conversationMove
     case silent
     case complete
@@ -45,7 +46,25 @@ enum RetainedPersonhoodRuntimeVerifier {
                     ) == .complete,
                 "conversation_move continuation policy can create duplicate speech"
             )
-            print(#"{"ok":true,"checks":{"conversationMoveAlreadySpokenCompletesSilently":true}}"#)
+            let invalidDelegate = ToolExecutionResult(
+                ok: false,
+                output: "proposal rejected",
+                metadata: ["result_code": .string("proposal_invalid")]
+            )
+            try expect(
+                ToolRegistry.continuation(
+                    for: "delegate_task",
+                    result: invalidDelegate,
+                    turnAlreadySpoke: false
+                ) == .delegateRetry
+                    && ToolRegistry.continuation(
+                        for: "delegate_task",
+                        result: invalidDelegate,
+                        turnAlreadySpoke: true
+                    ) == .complete,
+                "schema-invalid delegated work did not receive one private repair opportunity"
+            )
+            print(#"{"ok":true,"checks":{"conversationMoveAlreadySpokenCompletesSilently":true,"invalidDelegateRetriesPrivatelyOnce":true}}"#)
             return
         }
         let root = FileManager.default.temporaryDirectory
@@ -59,6 +78,7 @@ enum RetainedPersonhoodRuntimeVerifier {
 
         let allowedFunctions: Set<String> = [
             "delegate_task",
+            "codex_project_chat",
             "conversation_move",
             "memory_search",
             "memory_read",

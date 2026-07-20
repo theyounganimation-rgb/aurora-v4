@@ -22,6 +22,8 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
     case taskBusy
     case turnAlreadyActive
     case noActiveTurn
+    case threadUnavailable
+    case threadWorkingDirectoryChanged
     case unknownServerRequest
 
     var errorDescription: String? {
@@ -68,6 +70,10 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
             return "That Codex task already has an active turn."
         case .noActiveTurn:
             return "That Codex task has no active turn."
+        case .threadUnavailable:
+            return "That Codex task is no longer available as an unarchived persistent task."
+        case .threadWorkingDirectoryChanged:
+            return "That Codex task is no longer in the selected project."
         case .unknownServerRequest:
             return "That Codex server request is no longer pending."
         }
@@ -271,6 +277,112 @@ struct CodexTaskAccountSnapshot: Sendable, Equatable {
     let planType: String?
 }
 
+/// Typed surface Aurora uses to inspect and manage the same Codex
+/// threads shown by the ChatGPT/Codex desktop app. Ordinary ChatGPT chats are
+/// intentionally outside app-server's supported protocol.
+struct AuroraCodexThreadQuery: Sendable, Equatable {
+    var searchTerm: String?
+    var workingDirectory: URL?
+    var cursor: String?
+    var limit: Int
+    var archived: Bool
+
+    init(
+        searchTerm: String? = nil,
+        workingDirectory: URL? = nil,
+        cursor: String? = nil,
+        limit: Int = 50,
+        archived: Bool = false
+    ) {
+        self.searchTerm = searchTerm
+        self.workingDirectory = workingDirectory
+        self.cursor = cursor
+        self.limit = limit
+        self.archived = archived
+    }
+}
+
+struct AuroraCodexThreadSummary: Sendable, Equatable {
+    let threadID: String
+    let name: String?
+    let preview: String
+    let workingDirectory: URL
+    let status: String
+    let source: String
+    let createdAt: Date
+    let updatedAt: Date
+    let ephemeral: Bool
+}
+
+struct AuroraCodexThreadPage: Sendable, Equatable {
+    let threads: [AuroraCodexThreadSummary]
+    let nextCursor: String?
+}
+
+struct AuroraCodexThreadDocument: Sendable, Equatable {
+    let summary: AuroraCodexThreadSummary
+    /// Canonical bounded JSON returned by thread/read. This preserves Codex's
+    /// evolving item vocabulary without leaking unvalidated dictionaries into
+    /// the rest of Aurora.
+    let canonicalThreadJSON: Data
+}
+
+protocol AuroraCodexAppAPI: Sendable {
+    /// Creates one persistent Codex thread and starts its first turn. The task
+    /// identifier is Aurora-owned; the returned thread/turn identifiers are the
+    /// app-server identities shown by Codex Desktop.
+    func startTask(
+        taskID: String,
+        input: String,
+        options: CodexTaskThreadOptions
+    ) async throws -> CodexTaskHandle
+    /// Creates a persistent project thread from the exact owner-authored text.
+    /// The options must identify a working directory and may not add developer
+    /// instructions or dynamic tools; those are Aurora's delegated-task
+    /// scaffold and do not belong in an owner-selected Codex conversation.
+    func startRawProjectThread(
+        taskID: String,
+        input: String,
+        options: CodexTaskThreadOptions
+    ) async throws -> CodexTaskHandle
+    /// Sends exact owner-authored text to an existing persistent Codex thread.
+    /// The runtime revalidates the unarchived thread and expected project, then
+    /// preserves the thread's existing model, instructions, and permissions.
+    func sendRawProjectMessage(
+        taskID: String,
+        threadID: String,
+        input: String,
+        expectedWorkingDirectory: URL
+    ) async throws -> CodexTaskHandle
+    /// Reads and, when necessary, subscribes to an existing selected project
+    /// thread without starting a turn or replacing any server-owned settings.
+    func reconcileExactProjectThread(
+        taskID: String,
+        threadID: String,
+        expectedWorkingDirectory: URL
+    ) async throws -> CodexDelegateTaskReconciliation
+    /// Continues a completed thread as a new turn, or steers the currently
+    /// running turn without inventing a second task.
+    func continueTask(
+        taskID: String,
+        input: String,
+        reasoningEffort: CodexTaskReasoningEffort?
+    ) async throws -> CodexTaskHandle
+    func steerTask(taskID: String, input: String) async throws
+    func interruptTask(taskID: String) async throws
+    func listThreads(
+        query: AuroraCodexThreadQuery
+    ) async throws -> AuroraCodexThreadPage
+    func readThread(
+        threadID: String,
+        includeTurns: Bool
+    ) async throws -> AuroraCodexThreadDocument
+    func renameThread(threadID: String, name: String) async throws
+    func archiveThread(threadID: String) async throws
+    func unarchiveThread(threadID: String) async throws
+    func openThreadInDesktop(threadID: String) async -> Bool
+}
+
 enum CodexTaskServerRequestID: Sendable, Hashable, Equatable {
     case integer(Int64)
     case string(String)
@@ -353,11 +465,9 @@ protocol CodexTaskExecutableValidating: Sendable {
     func validate(executableURL: URL) throws
 }
 
-/// Makes a persistent standalone app-server thread resident in Codex Desktop.
-/// Shared-daemon threads already stream through Desktop's initialized
-/// connection and deliberately skip this compatibility deeplink. When Aurora
-/// falls back to its own stdio app-server, the deeplink loads the existing
-/// identity; it never creates or duplicates a thread.
+/// Makes an existing persistent app-server thread visible in Codex Desktop.
+/// The deeplink loads the existing identity; it never creates, executes, or
+/// duplicates a thread and is not evidence that the task itself succeeded.
 protocol CodexDesktopThreadRegistering: Sendable {
     func registerPersistentThread(threadID: String) async -> Bool
 }
@@ -392,8 +502,13 @@ struct OpenAICodexTaskExecutableValidator: CodexTaskExecutableValidating {
     }
 }
 
-actor CodexTaskRuntime {
+actor CodexTaskRuntime: AuroraCodexAppAPI {
     typealias EventHandler = @Sendable (CodexTaskRuntimeEvent) -> Void
+
+    private enum RawProjectTurnState: Equatable {
+        case inactive
+        case active(turnID: String)
+    }
 
     private struct PendingRPC {
         let method: String
@@ -434,6 +549,10 @@ actor CodexTaskRuntime {
     private var taskThreads: [String: String] = [:]
     private var threadTasks: [String: String] = [:]
     private var threadOptions: [String: CodexTaskThreadOptions] = [:]
+    /// Existing owner-selected Codex threads retain their server-owned
+    /// settings. Their expected cwd is a resource identity check, not a
+    /// thread/resume override.
+    private var preservedThreadWorkingDirectories: [String: URL] = [:]
     private var loadedThreadIDs = Set<String>()
     private var activeTurnByTask: [String: String] = [:]
     private var busyTaskIDs = Set<String>()
@@ -526,6 +645,123 @@ actor CodexTaskRuntime {
         try await start()
     }
 
+    func listThreads(
+        query: AuroraCodexThreadQuery = AuroraCodexThreadQuery()
+    ) async throws -> AuroraCodexThreadPage {
+        try Self.validateThreadQuery(query)
+        try await start()
+        try requireVerifiedChatGPTAccount()
+        var params: [String: Any] = [
+            "limit": query.limit,
+            "archived": query.archived,
+            // Codex Desktop currently persists app-server-created tasks with
+            // the Desktop source identity (`vscode`) while retaining
+            // `thread_source = appServer` in the rollout. Query every source
+            // kind supported by the installed protocol so Aurora never hides
+            // a valid task merely because of that storage projection.
+            "modelProviders": [],
+            "sourceKinds": [
+                "cli",
+                "vscode",
+                "exec",
+                "appServer",
+                "subAgent",
+                "subAgentReview",
+                "subAgentCompact",
+                "subAgentThreadSpawn",
+                "subAgentOther",
+                "unknown",
+            ],
+            "sortKey": "updated_at",
+            "sortDirection": "desc",
+            // The default scan-and-repair path makes newly archived or moved
+            // rollouts visible even when the state DB has stale metadata.
+            "useStateDbOnly": false,
+        ]
+        if let searchTerm = query.searchTerm { params["searchTerm"] = searchTerm }
+        if let workingDirectory = query.workingDirectory {
+            params["cwd"] = workingDirectory.standardizedFileURL.path
+        }
+        if let cursor = query.cursor { params["cursor"] = cursor }
+        let result = try await rpc(method: "thread/list", params: params)
+        let object = try Self.decodeObject(
+            result,
+            maximumBytes: configuration.maximumInboundLineBytes
+        )
+        guard let rawThreads = object["data"] as? [[String: Any]],
+              rawThreads.count <= query.limit else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        let threads = try rawThreads.map(Self.desktopThreadSummary)
+        let nextCursor = try Self.optionalBoundedProtocolString(
+            object["nextCursor"],
+            maximumBytes: 4_096
+        )
+        return AuroraCodexThreadPage(threads: threads, nextCursor: nextCursor)
+    }
+
+    func readThread(
+        threadID: String,
+        includeTurns: Bool = true
+    ) async throws -> AuroraCodexThreadDocument {
+        try Self.validateOpaqueID(threadID)
+        try await start()
+        try requireVerifiedChatGPTAccount()
+        let result = try await rpc(method: "thread/read", params: [
+            "threadId": threadID,
+            "includeTurns": includeTurns,
+        ])
+        let object = try Self.decodeObject(
+            result,
+            maximumBytes: configuration.maximumInboundLineBytes
+        )
+        guard let thread = object["thread"] as? [String: Any] else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        let summary = try Self.desktopThreadSummary(thread)
+        guard summary.threadID == threadID else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        let canonical = try Self.canonicalJSONData(
+            thread,
+            maximumBytes: configuration.maximumInboundLineBytes
+        )
+        return AuroraCodexThreadDocument(
+            summary: summary,
+            canonicalThreadJSON: canonical
+        )
+    }
+
+    func renameThread(threadID: String, name: String) async throws {
+        try Self.validateOpaqueID(threadID)
+        try Self.validateThreadName(name)
+        try await start()
+        try requireVerifiedChatGPTAccount()
+        _ = try await rpc(method: "thread/name/set", params: [
+            "threadId": threadID,
+            "name": name,
+        ])
+    }
+
+    func archiveThread(threadID: String) async throws {
+        try Self.validateOpaqueID(threadID)
+        try await start()
+        try requireVerifiedChatGPTAccount()
+        _ = try await rpc(method: "thread/archive", params: ["threadId": threadID])
+    }
+
+    func unarchiveThread(threadID: String) async throws {
+        try Self.validateOpaqueID(threadID)
+        try await start()
+        try requireVerifiedChatGPTAccount()
+        _ = try await rpc(method: "thread/unarchive", params: ["threadId": threadID])
+    }
+
+    func openThreadInDesktop(threadID: String) async -> Bool {
+        guard (try? Self.validateOpaqueID(threadID)) != nil else { return false }
+        return await desktopThreadRegistrar.registerPersistentThread(threadID: threadID)
+    }
+
     func startTask(
         taskID: String,
         input: String,
@@ -589,12 +825,205 @@ actor CodexTaskRuntime {
                 await self?.setThreadNameBestEffort(threadID: threadID, name: threadName)
             }
         }
-        if !options.ephemeral, !usingSharedDaemon {
-            _ = await desktopThreadRegistrar.registerPersistentThread(
-                threadID: threadID
-            )
+        if !options.ephemeral {
+            // The shared daemon owns execution and persistence; the documented
+            // deep link is only a best-effort Desktop visibility nudge. It is
+            // never part of execution truth, task acceptance latency, or a
+            // second thread.
+            let registrar = desktopThreadRegistrar
+            Task {
+                _ = await registrar.registerPersistentThread(threadID: threadID)
+            }
         }
         return handle
+    }
+
+    func startRawProjectThread(
+        taskID: String,
+        input: String,
+        options: CodexTaskThreadOptions
+    ) async throws -> CodexTaskHandle {
+        guard options.workingDirectory != nil,
+              !options.ephemeral,
+              options.developerInstructions == nil,
+              options.dynamicTools.isEmpty else {
+            throw CodexTaskRuntimeError.invalidInput
+        }
+        // `startTask` transmits input byte-for-byte. This constrained entry
+        // point prevents the delegated-task developer prompt and receipt tools
+        // from leaking into an explicitly owner-directed Codex conversation.
+        return try await startTask(taskID: taskID, input: input, options: options)
+    }
+
+    func sendRawProjectMessage(
+        taskID: String,
+        threadID: String,
+        input: String,
+        expectedWorkingDirectory: URL
+    ) async throws -> CodexTaskHandle {
+        try Self.validateTaskID(taskID)
+        try Self.validateOpaqueID(threadID, failure: .invalidThreadIdentifier)
+        try validateInput(input)
+        let expectedDirectory = expectedWorkingDirectory.standardizedFileURL
+        guard expectedDirectory.isFileURL,
+              expectedDirectory.path.hasPrefix("/"),
+              !expectedDirectory.path.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw CodexTaskRuntimeError.invalidInput
+        }
+        try beginExclusiveTaskOperation(taskID)
+        defer { busyTaskIDs.remove(taskID) }
+
+        try await start()
+        try requireVerifiedChatGPTAccount()
+        try await requireUnarchivedPersistentThread(
+            threadID: threadID,
+            expectedWorkingDirectory: expectedDirectory
+        )
+        let initialState = try await rawProjectTurnState(
+            threadID: threadID,
+            expectedWorkingDirectory: expectedDirectory
+        )
+        try validatePreservingThreadBinding(
+            taskID: taskID,
+            threadID: threadID,
+            expectedWorkingDirectory: expectedDirectory
+        )
+        if !loadedThreadIDs.contains(threadID) {
+            try await resumePreservingThreadSettings(
+                threadID: threadID,
+                expectedWorkingDirectory: expectedDirectory
+            )
+        }
+        try bindPreservingThreadSettings(
+            taskID: taskID,
+            to: threadID,
+            expectedWorkingDirectory: expectedDirectory
+        )
+        synchronizeRawTurnState(initialState, taskID: taskID)
+        let clientMessageID = Self.makeClientMessageID()
+
+        do {
+            return try await performRawProjectSend(
+                taskID: taskID,
+                threadID: threadID,
+                input: input,
+                clientMessageID: clientMessageID,
+                state: initialState
+            )
+        } catch let original as CodexTaskRuntimeError {
+            guard case .serverError = original else { throw original }
+            // Another Codex client can complete or begin a turn after our
+            // read. Re-read once and retry only when that observable state
+            // actually changed. Transport failures and unchanged rejections
+            // are never replayed, preventing duplicate owner messages.
+            try await requireUnarchivedPersistentThread(
+                threadID: threadID,
+                expectedWorkingDirectory: expectedDirectory
+            )
+            let refreshedState = try await rawProjectTurnState(
+                threadID: threadID,
+                expectedWorkingDirectory: expectedDirectory
+            )
+            guard refreshedState != initialState else { throw original }
+            synchronizeRawTurnState(refreshedState, taskID: taskID)
+            return try await performRawProjectSend(
+                taskID: taskID,
+                threadID: threadID,
+                input: input,
+                clientMessageID: clientMessageID,
+                state: refreshedState
+            )
+        }
+    }
+
+    /// Coordinator-facing spelling for the same exact-text project-chat path.
+    /// Kept distinct from `continueTask`, whose caller may intentionally build
+    /// an Aurora delegated-task update prompt.
+    func sendExactMessage(
+        taskID: String,
+        threadID: String,
+        input: String,
+        expectedWorkingDirectory: URL
+    ) async throws -> CodexTaskHandle {
+        try await sendRawProjectMessage(
+            taskID: taskID,
+            threadID: threadID,
+            input: input,
+            expectedWorkingDirectory: expectedWorkingDirectory
+        )
+    }
+
+    func reconcileExactProjectThread(
+        taskID: String,
+        threadID: String,
+        expectedWorkingDirectory: URL
+    ) async throws -> CodexDelegateTaskReconciliation {
+        try Self.validateTaskID(taskID)
+        try Self.validateOpaqueID(threadID, failure: .invalidThreadIdentifier)
+        let expectedDirectory = expectedWorkingDirectory.standardizedFileURL
+        guard expectedDirectory.isFileURL,
+              expectedDirectory.path.hasPrefix("/"),
+              !expectedDirectory.path.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw CodexTaskRuntimeError.invalidInput
+        }
+        try beginExclusiveTaskOperation(taskID)
+        defer { busyTaskIDs.remove(taskID) }
+
+        try await start()
+        try requireVerifiedChatGPTAccount()
+        try await requireUnarchivedPersistentThread(
+            threadID: threadID,
+            expectedWorkingDirectory: expectedDirectory
+        )
+        let firstRead = try await rpc(method: "thread/read", params: [
+            "threadId": threadID,
+            "includeTurns": true,
+        ])
+        var observation = try Self.exactProjectReconciliation(
+            from: firstRead,
+            expectedThreadID: threadID,
+            expectedWorkingDirectory: expectedDirectory
+        )
+        try validatePreservingThreadBinding(
+            taskID: taskID,
+            threadID: threadID,
+            expectedWorkingDirectory: expectedDirectory
+        )
+
+        if observation.status == .running,
+           observation.latestTurnID != nil,
+           !loadedThreadIDs.contains(threadID) {
+            // Resuming subscribes this client to subsequent events but does
+            // not start a model turn. Supplying only the identity preserves
+            // the selected thread's model, instructions, and permissions.
+            try await resumePreservingThreadSettings(
+                threadID: threadID,
+                expectedWorkingDirectory: expectedDirectory
+            )
+        }
+        try bindPreservingThreadSettings(
+            taskID: taskID,
+            to: threadID,
+            expectedWorkingDirectory: expectedDirectory
+        )
+        synchronizeReconciledTurn(observation, taskID: taskID)
+
+        if observation.status == .running, observation.latestTurnID != nil {
+            // Close read→subscribe races. Completion before resume is captured
+            // here; completion after this read arrives through the now-bound
+            // runtime event stream.
+            let refreshed = try await rpc(method: "thread/read", params: [
+                "threadId": threadID,
+                "includeTurns": true,
+            ])
+            observation = try Self.exactProjectReconciliation(
+                from: refreshed,
+                expectedThreadID: threadID,
+                expectedWorkingDirectory: expectedDirectory
+            )
+            synchronizeReconciledTurn(observation, taskID: taskID)
+        }
+        return observation
     }
 
     private func setThreadNameBestEffort(threadID: String, name: String) async {
@@ -959,7 +1388,14 @@ actor CodexTaskRuntime {
                     "title": "Aurora",
                     "version": "1.0",
                 ],
-                "capabilities": NSNull(),
+                // Aurora's host-owned effect receipt is supplied through the
+                // app-server `dynamicTools` field on thread/start. The field
+                // is capability-gated by current Codex app-server builds; a
+                // null capability set makes the shared ChatGPT daemon reject
+                // the task before turn/start.
+                "capabilities": [
+                    "experimentalApi": true,
+                ],
             ])
             try Task.checkCancellation()
             try await sendNotification(method: "initialized", params: [:])
@@ -1040,6 +1476,13 @@ actor CodexTaskRuntime {
 
     private func ensureThreadLoaded(_ threadID: String) async throws {
         guard !loadedThreadIDs.contains(threadID) else { return }
+        if let expectedDirectory = preservedThreadWorkingDirectories[threadID] {
+            try await resumePreservingThreadSettings(
+                threadID: threadID,
+                expectedWorkingDirectory: expectedDirectory
+            )
+            return
+        }
         guard let options = threadOptions[threadID] else {
             throw CodexTaskRuntimeError.protocolViolation
         }
@@ -1072,6 +1515,193 @@ actor CodexTaskRuntime {
             throw CodexTaskRuntimeError.protocolViolation
         }
         loadedThreadIDs.insert(threadID)
+    }
+
+    private func resumePreservingThreadSettings(
+        threadID: String,
+        expectedWorkingDirectory: URL
+    ) async throws {
+        let result = try await rpc(method: "thread/resume", params: [
+            "threadId": threadID,
+        ])
+        guard try Self.threadID(from: result) == threadID else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        let response = try Self.decodeObject(
+            result,
+            maximumBytes: configuration.maximumInboundLineBytes
+        )
+        guard let returnedDirectory = response["cwd"] as? String,
+              returnedDirectory.hasPrefix("/"),
+              returnedDirectory.utf8.count <= 4_096,
+              !returnedDirectory.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        guard URL(fileURLWithPath: returnedDirectory).standardizedFileURL.path
+                == expectedWorkingDirectory.path else {
+            throw CodexTaskRuntimeError.threadWorkingDirectoryChanged
+        }
+        loadedThreadIDs.insert(threadID)
+    }
+
+    private func requireUnarchivedPersistentThread(
+        threadID: String,
+        expectedWorkingDirectory: URL
+    ) async throws {
+        var cursor: String?
+        var seenCursors = Set<String>()
+        // Project selection is normally followed immediately by this check.
+        // Twenty protocol-maximal pages leaves bounded room for unusually
+        // large projects without permitting an unbounded server walk.
+        for _ in 0..<20 {
+            var params: [String: Any] = [
+                "limit": 100,
+                "archived": false,
+                "cwd": expectedWorkingDirectory.path,
+                "modelProviders": [],
+                "sourceKinds": [
+                    "cli", "vscode", "exec", "appServer", "subAgent",
+                    "subAgentReview", "subAgentCompact", "subAgentThreadSpawn",
+                    "subAgentOther", "unknown",
+                ],
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "useStateDbOnly": false,
+            ]
+            if let cursor { params["cursor"] = cursor }
+            let result = try await rpc(method: "thread/list", params: params)
+            let object = try Self.decodeObject(
+                result,
+                maximumBytes: configuration.maximumInboundLineBytes
+            )
+            guard let rawThreads = object["data"] as? [[String: Any]],
+                  rawThreads.count <= 100 else {
+                throw CodexTaskRuntimeError.protocolViolation
+            }
+            for rawThread in rawThreads {
+                let summary = try Self.desktopThreadSummary(rawThread)
+                guard summary.threadID == threadID else { continue }
+                guard summary.workingDirectory.path == expectedWorkingDirectory.path else {
+                    throw CodexTaskRuntimeError.threadWorkingDirectoryChanged
+                }
+                guard !summary.ephemeral else {
+                    throw CodexTaskRuntimeError.threadUnavailable
+                }
+                return
+            }
+            guard let nextCursor = try Self.optionalBoundedProtocolString(
+                object["nextCursor"],
+                maximumBytes: 4_096
+            ) else {
+                throw CodexTaskRuntimeError.threadUnavailable
+            }
+            guard seenCursors.insert(nextCursor).inserted else {
+                throw CodexTaskRuntimeError.protocolViolation
+            }
+            cursor = nextCursor
+        }
+        throw CodexTaskRuntimeError.threadUnavailable
+    }
+
+    private func rawProjectTurnState(
+        threadID: String,
+        expectedWorkingDirectory: URL
+    ) async throws -> RawProjectTurnState {
+        let result = try await rpc(method: "thread/read", params: [
+            "threadId": threadID,
+            "includeTurns": true,
+        ])
+        let object = try Self.decodeObject(
+            result,
+            maximumBytes: configuration.maximumInboundLineBytes
+        )
+        guard let thread = object["thread"] as? [String: Any] else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        let summary = try Self.desktopThreadSummary(thread)
+        guard summary.threadID == threadID else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        guard summary.workingDirectory.path == expectedWorkingDirectory.path else {
+            throw CodexTaskRuntimeError.threadWorkingDirectoryChanged
+        }
+        guard !summary.ephemeral,
+              let turns = thread["turns"] as? [[String: Any]] else {
+            throw CodexTaskRuntimeError.threadUnavailable
+        }
+        guard let latestTurn = turns.last else { return .inactive }
+        let turnID = try Self.requiredString("id", in: latestTurn)
+        try Self.validateOpaqueID(turnID)
+        switch latestTurn["status"] as? String {
+        case "inProgress":
+            return .active(turnID: turnID)
+        case "completed", "interrupted", "failed":
+            return .inactive
+        default:
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+    }
+
+    private func synchronizeRawTurnState(
+        _ state: RawProjectTurnState,
+        taskID: String
+    ) {
+        switch state {
+        case .inactive:
+            activeTurnByTask.removeValue(forKey: taskID)
+        case .active(let turnID):
+            activeTurnByTask[taskID] = turnID
+        }
+    }
+
+    private func synchronizeReconciledTurn(
+        _ observation: CodexDelegateTaskReconciliation,
+        taskID: String
+    ) {
+        if observation.status == .running,
+           let turnID = observation.latestTurnID {
+            activeTurnByTask[taskID] = turnID
+        } else {
+            activeTurnByTask.removeValue(forKey: taskID)
+        }
+    }
+
+    private func performRawProjectSend(
+        taskID: String,
+        threadID: String,
+        input: String,
+        clientMessageID: String,
+        state: RawProjectTurnState
+    ) async throws -> CodexTaskHandle {
+        switch state {
+        case .inactive:
+            let params: [String: Any] = [
+                "threadId": threadID,
+                "clientUserMessageId": clientMessageID,
+                "input": Self.textInput(input),
+            ]
+            // Intentionally no effort/model/instructions override: this is a
+            // user-selected Codex conversation, not an Aurora-owned worker.
+            let result = try await rpc(method: "turn/start", params: params)
+            let turnID = try Self.turnID(from: result)
+            if !recentlyCompletedTurnIDs.contains(turnID) {
+                activeTurnByTask[taskID] = turnID
+            }
+            return CodexTaskHandle(taskID: taskID, threadID: threadID, turnID: turnID)
+
+        case .active(let turnID):
+            let result = try await rpc(method: "turn/steer", params: [
+                "threadId": threadID,
+                "expectedTurnId": turnID,
+                "clientUserMessageId": clientMessageID,
+                "input": Self.textInput(input),
+            ])
+            let returnedTurnID = try Self.requiredString("turnId", inJSON: result)
+            guard returnedTurnID == turnID else {
+                throw CodexTaskRuntimeError.protocolViolation
+            }
+            return CodexTaskHandle(taskID: taskID, threadID: threadID, turnID: turnID)
+        }
     }
 
     private func rpc(method: String, params: [String: Any]) async throws -> Data {
@@ -1366,6 +1996,7 @@ actor CodexTaskRuntime {
             taskThreads.removeValue(forKey: taskID)
             threadTasks.removeValue(forKey: threadID)
             threadOptions.removeValue(forKey: threadID)
+            preservedThreadWorkingDirectories.removeValue(forKey: threadID)
             loadedThreadIDs.remove(threadID)
             activeTurnByTask.removeValue(forKey: taskID)
             expireServerRequests(taskID: taskID, turnID: nil)
@@ -1497,6 +2128,38 @@ actor CodexTaskRuntime {
         taskThreads[taskID] = threadID
         threadTasks[threadID] = taskID
         threadOptions[threadID] = options
+    }
+
+    private func bindPreservingThreadSettings(
+        taskID: String,
+        to threadID: String,
+        expectedWorkingDirectory: URL
+    ) throws {
+        try validatePreservingThreadBinding(
+            taskID: taskID,
+            threadID: threadID,
+            expectedWorkingDirectory: expectedWorkingDirectory
+        )
+        taskThreads[taskID] = threadID
+        threadTasks[threadID] = taskID
+        preservedThreadWorkingDirectories[threadID] = expectedWorkingDirectory
+    }
+
+    private func validatePreservingThreadBinding(
+        taskID: String,
+        threadID: String,
+        expectedWorkingDirectory: URL
+    ) throws {
+        if let existingThread = taskThreads[taskID], existingThread != threadID {
+            throw CodexTaskRuntimeError.taskAlreadyExists
+        }
+        if let existingTask = threadTasks[threadID], existingTask != taskID {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        if let existingDirectory = preservedThreadWorkingDirectories[threadID],
+           existingDirectory.path != expectedWorkingDirectory.path {
+            throw CodexTaskRuntimeError.threadWorkingDirectoryChanged
+        }
     }
 
     private func validateConfiguration() throws {
@@ -1765,6 +2428,118 @@ actor CodexTaskRuntime {
         }
     }
 
+    private static func validateThreadQuery(_ query: AuroraCodexThreadQuery) throws {
+        guard (1...100).contains(query.limit) else {
+            throw CodexTaskRuntimeError.invalidInput
+        }
+        if let searchTerm = query.searchTerm {
+            guard !searchTerm.isEmpty,
+                  searchTerm.utf8.count <= 512,
+                  !searchTerm.unicodeScalars.contains(where: { $0.value == 0 }) else {
+                throw CodexTaskRuntimeError.invalidInput
+            }
+        }
+        if let directory = query.workingDirectory {
+            guard directory.isFileURL,
+                  directory.standardizedFileURL.path.hasPrefix("/"),
+                  !directory.path.unicodeScalars.contains(where: { $0.value == 0 }) else {
+                throw CodexTaskRuntimeError.invalidInput
+            }
+        }
+        if let cursor = query.cursor {
+            guard !cursor.isEmpty,
+                  cursor.utf8.count <= 4_096,
+                  cursor.unicodeScalars.allSatisfy({
+                      $0.value >= 0x20 && $0.value <= 0x7e
+                  }) else {
+                throw CodexTaskRuntimeError.invalidInput
+            }
+        }
+    }
+
+    private static func validateThreadName(_ name: String) throws {
+        guard !name.isEmpty,
+              name.utf8.count <= 512,
+              name == name.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.unicodeScalars.contains(where: {
+                  CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw CodexTaskRuntimeError.invalidInput
+        }
+    }
+
+    private static func desktopThreadSummary(
+        _ object: [String: Any]
+    ) throws -> AuroraCodexThreadSummary {
+        guard let threadID = object["id"] as? String,
+              let preview = object["preview"] as? String,
+              preview.utf8.count <= 8_192,
+              !preview.unicodeScalars.contains(where: { $0.value == 0 }),
+              let cwd = object["cwd"] as? String,
+              cwd.hasPrefix("/"),
+              cwd.utf8.count <= 4_096,
+              !cwd.unicodeScalars.contains(where: { $0.value == 0 }),
+              let ephemeral = object["ephemeral"] as? Bool,
+              let statusObject = object["status"] as? [String: Any],
+              let status = statusObject["type"] as? String,
+              Set(["notLoaded", "idle", "active", "systemError"]).contains(status),
+              let createdAt = protocolTimestamp(object["createdAt"]),
+              let updatedAt = protocolTimestamp(object["updatedAt"]) else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        try validateOpaqueID(threadID, failure: .invalidThreadIdentifier)
+        let name = try optionalBoundedProtocolString(
+            object["name"],
+            maximumBytes: 512
+        )
+        let source: String
+        if let value = object["source"] as? String,
+           value.utf8.count <= 64 {
+            source = value
+        } else if let value = object["source"] as? [String: Any],
+                  value.keys.count == 1,
+                  let key = value.keys.first,
+                  key.utf8.count <= 64 {
+            source = key
+        } else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        return AuroraCodexThreadSummary(
+            threadID: threadID,
+            name: name,
+            preview: preview,
+            workingDirectory: URL(fileURLWithPath: cwd).standardizedFileURL,
+            status: status,
+            source: source,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            ephemeral: ephemeral
+        )
+    }
+
+    private static func protocolTimestamp(_ value: Any?) -> Date? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let seconds = number.doubleValue
+        guard seconds.isFinite,
+              seconds >= 0,
+              seconds <= 32_503_680_000 else { return nil }
+        return Date(timeIntervalSince1970: seconds)
+    }
+
+    private static func optionalBoundedProtocolString(
+        _ value: Any?,
+        maximumBytes: Int
+    ) throws -> String? {
+        if value == nil || value is NSNull { return nil }
+        guard let string = value as? String,
+              string.utf8.count <= maximumBytes,
+              !string.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        return string
+    }
+
     private static func threadID(from data: Data) throws -> String {
         let object = try jsonObject(data)
         guard let thread = object["thread"] as? [String: Any] else {
@@ -1867,6 +2642,33 @@ actor CodexTaskRuntime {
             threadName: name,
             workspacePath: cwd,
             effectReceipts: effectReceipts
+        )
+    }
+
+    private static func exactProjectReconciliation(
+        from data: Data,
+        expectedThreadID: String,
+        expectedWorkingDirectory: URL
+    ) throws -> CodexDelegateTaskReconciliation {
+        let object = try jsonObject(data)
+        guard let thread = object["thread"] as? [String: Any] else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        let summary = try desktopThreadSummary(thread)
+        guard summary.threadID == expectedThreadID else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        guard !summary.ephemeral else {
+            throw CodexTaskRuntimeError.threadUnavailable
+        }
+        guard summary.workingDirectory.path
+                == expectedWorkingDirectory.standardizedFileURL.path else {
+            throw CodexTaskRuntimeError.threadWorkingDirectoryChanged
+        }
+        return try reconciliation(
+            from: data,
+            expectedThreadID: expectedThreadID,
+            expectedDynamicToolNames: []
         )
     }
 
@@ -2163,6 +2965,17 @@ actor CodexTaskRuntime {
             with: data,
             options: [.fragmentsAllowed]
         ) as? [String: Any] else {
+            throw CodexTaskRuntimeError.protocolViolation
+        }
+        return object
+    }
+
+    private static func decodeObject(
+        _ data: Data,
+        maximumBytes: Int
+    ) throws -> [String: Any] {
+        guard let object = try decodeBoundedJSON(data, maximumBytes: maximumBytes)
+                as? [String: Any] else {
             throw CodexTaskRuntimeError.protocolViolation
         }
         return object

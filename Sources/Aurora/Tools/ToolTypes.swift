@@ -82,6 +82,7 @@ public struct RealtimeFunctionSchema: Codable, Sendable, Equatable {
 public enum ToolEvidencePolicy {
     private static let finalizedTranscriptTools: Set<String> = [
         "delegate_task",
+        "codex_project_chat",
         "conversation_move",
         "memory_search",
         "memory_read",

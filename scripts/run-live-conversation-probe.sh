@@ -24,6 +24,9 @@ swiftc \
   "$ROOT/Sources/Aurora/Infrastructure/AuroraPaths.swift" \
   "$ROOT/Sources/Aurora/Infrastructure/KeychainVoiceKey.swift" \
   "$ROOT/Sources/Aurora/App/AuroraVoiceInstructions.swift" \
+  "$ROOT/Sources/Aurora/Tools/ToolAuditJournal.swift" \
+  "$ROOT/Sources/Aurora/Tools/ToolTypes.swift" \
+  "$ROOT/Sources/Aurora/Codex/DelegateTaskProposal.swift" \
   "$ROOT/scripts/probe-live-conversation.swift" \
   -framework Security \
   -o "$OUT"
