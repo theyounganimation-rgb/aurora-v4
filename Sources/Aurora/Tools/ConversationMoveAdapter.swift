@@ -71,6 +71,14 @@ enum ConversationMoveAdapter {
             return rejected("the live turn did not have complete causal provenance")
         }
 
+        // Realtime owns semantic intent resolution. This is not a host-side
+        // phrase parser: it simply prevents Realtime from describing an action
+        // domain in structured data and then accidentally taking the social
+        // continuation, which disables every action tool before speech.
+        if proposal.turnDomain != .social {
+            return routeMismatch(proposal.turnDomain)
+        }
+
         do {
             let grounding = AgencyGroundingReference(
                 id: "agency-grounding-\(context.callID)",
@@ -128,12 +136,13 @@ enum ConversationMoveAdapter {
                 authoringSourceID: "conversation-position-\(context.callID)",
                 sourceSessionID: sessionID,
                 sourceTurnIDs: [sourceTurnID],
-                expiresAt: date.addingTimeInterval(8 * 3_600),
+                expiresAt: date.addingTimeInterval(15 * 60),
                 confidence: 0.72,
                 salience: 0.62,
-                projectionEligible: ![
-                    "boundary", "closing", "acknowledgement",
-                ].contains(proposal.perceivedTurn)
+                // This record scaffolds the immediate reply only. Anything
+                // Aurora genuinely wants to carry into later turns must be an
+                // explicit record_update with its own bounded lifecycle.
+                projectionEligible: false
             )
             let prepared = try await agency.prepareConversationMove(
                 AgencyConversationMoveTransaction(
@@ -382,6 +391,31 @@ enum ConversationMoveAdapter {
                 "effect_verified": .bool(false),
                 "external_side_effect": .bool(false),
                 "result_code": .string("conversation_move_rejected"),
+            ]
+        )
+    }
+
+    private static func routeMismatch(
+        _ domain: ConversationTurnDomain
+    ) -> ToolExecutionResult {
+        let retryTool: String
+        switch domain {
+        case .social:
+            return rejected("the conversational route was inconsistent")
+        case .delegatedAction:
+            retryTool = "delegate_task"
+        case .codexProjectChat:
+            retryTool = "codex_project_chat"
+        }
+        return ToolExecutionResult(
+            ok: false,
+            output: "PRIVATE ROUTE CORRECTION — use \(retryTool) for the same finalized owner turn. Preserve the exact intent and emit no audio.",
+            metadata: [
+                "agency_state_changed": .bool(false),
+                "effect_verified": .bool(false),
+                "external_side_effect": .bool(false),
+                "result_code": .string("conversation_move_route_mismatch"),
+                "semantic_retry_tool": .string(retryTool),
             ]
         )
     }

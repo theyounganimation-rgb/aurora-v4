@@ -178,10 +178,14 @@ enum RealtimeToolContinuation: Equatable {
     /// that decision with an assistant-style default.
     case conversationMove
     case delegateAccepted
-    /// Realtime produced an invalid structured task proposal. Correct the
+    /// Realtime produced an invalid structured semantic proposal. Correct the
     /// structure once against the original finalized owner turn without
     /// speaking or widening the authorized effect.
     case delegateRetry
+    /// Realtime truthfully classified the turn as a different semantic domain
+    /// while calling conversation_move. Retry once with only the correct
+    /// semantic function exposed; the host still never reparses owner words.
+    case semanticRouteRetry(toolName: String)
     case silent
     case complete
 }

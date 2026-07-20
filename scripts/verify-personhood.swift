@@ -103,7 +103,8 @@ enum PersonhoodVerification {
             instructions.contains("# Natural spoken English")
                 && instructions.contains("socially fluent woman talking live")
                 && instructions.contains("contractions")
-                && instructions.contains("light slang")
+                && instructions.contains("Mirror the person's register")
+                && instructions.contains("never perform slang")
                 && instructions.contains("Awkward, unfinished thoughts are fine"),
             "Aurora can still default to polished assistant prose"
         )

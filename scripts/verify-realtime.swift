@@ -472,10 +472,14 @@ enum RealtimeVerification {
 
     static func runProjectChatRouting() throws -> [String: Bool] {
         try explicitCodexProjectChatPrecedesOrdinaryDelegate()
+        try misclassifiedConversationMoveReroutesToCodexProjectChat()
         try invalidCodexProjectChatRetriesOnceWithoutLosingOwnerAuthority()
+        try semanticRetryCannotLaunderContinuationAuthority()
         return [
             "explicitCodexProjectChatPrecedesOrdinaryDelegate": true,
+            "misclassifiedConversationMoveReroutesToCodexProjectChat": true,
             "invalidCodexProjectChatRetriesOnce": true,
+            "semanticRetryCannotLaunderContinuationAuthority": true,
         ]
     }
 
@@ -3742,6 +3746,200 @@ enum RealtimeVerification {
         }, "the competing ordinary delegate was not superseded truthfully")
     }
 
+    private static func misclassifiedConversationMoveReroutesToCodexProjectChat() throws {
+        let tools = #"[{"type":"function","name":"conversation_move","description":"Social turns only.","parameters":{"type":"object","properties":{},"additionalProperties":true}},{"type":"function","name":"codex_project_chat","description":"Named Codex project/chat work.","parameters":{"type":"object","properties":{},"additionalProperties":true}}]"#
+        let harness = try makeHarness(toolsJSON: tools)
+        var calls: [RealtimeFunctionCall] = []
+        var diagnostics: [String] = []
+        harness.client.onFunctionCall = { calls.append($0) }
+        harness.client.onDiagnostic = { _, kind, _ in diagnostics.append(kind) }
+
+        try committedTurn(
+            "misrouted_project_input",
+            responseID: "misrouted_project_response",
+            harness: harness,
+            transcript: "I want to work in the Aurora V4 project."
+        )
+        try deliver(responseDone(
+            id: "misrouted_project_response",
+            status: "completed",
+            calls: [(
+                "misrouted_conversation_call",
+                "conversation_move",
+                #"{"turn_domain":"codex_project_chat"}"#
+            )]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard let initialCall = calls.first else {
+            throw VerificationFailure.failed(
+                "the misclassified conversation_move never reached host validation"
+            )
+        }
+        harness.client.submitFunctionResult(
+            connectionID: initialCall.connectionID,
+            callID: initialCall.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"conversation_move_route_mismatch","semantic_retry_tool":"codex_project_chat","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .semanticRouteRetry(toolName: "codex_project_chat")
+        )
+        harness.client.drainStateForVerification()
+
+        guard let reroute = harness.socket.sentEvents().last(where: { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else {
+                return false
+            }
+            return metadata["aurora_continuation"] as? String
+                == "semantic_route_retry_once"
+        })?["response"] as? [String: Any],
+        let rerouteTools = reroute["tools"] as? [[String: Any]],
+        let rerouteChoice = reroute["tool_choice"] as? [String: Any] else {
+            throw VerificationFailure.failed(
+                "a typed project-chat domain mismatch reached speech instead of a private reroute"
+            )
+        }
+        let rerouteInstructions = reroute["instructions"] as? String ?? ""
+        try expect(
+            rerouteTools.count == 1
+                && rerouteTools[0]["name"] as? String == "codex_project_chat"
+                && rerouteChoice["name"] as? String == "codex_project_chat"
+                && rerouteInstructions.contains("original owner audio")
+                && rerouteInstructions.contains("Emit no audio")
+                && diagnostics.contains("semantic_route_retry_scheduled"),
+            "the semantic reroute could speak, choose another tool, or lose the original turn"
+        )
+
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "misrouted_project_corrected", "status": "in_progress"],
+        ], harness: harness)
+        let correctedArguments = #"{"commitment":"execute","operation":"focus_project","project_name":"Aurora V4","chat_name":null,"thread_id":null,"message":null}"#
+        try deliver(responseDone(
+            id: "misrouted_project_corrected",
+            status: "completed",
+            calls: [(
+                "misrouted_project_corrected_call",
+                "codex_project_chat",
+                correctedArguments
+            )]
+        ), harness: harness)
+        harness.callbackQueue.sync {}
+        guard calls.count == 2 else {
+            throw VerificationFailure.failed(
+                "the forced Codex project-chat call did not return to host validation"
+            )
+        }
+        let correctedCall = calls[1]
+        try expect(
+            correctedCall.inputItemID == "misrouted_project_input"
+                && correctedCall.name == "codex_project_chat"
+                && correctedCall.authorizationSource == .directOwnerTurn
+                && correctedCall.sourceTurnFinalized,
+            "the semantic reroute lost exact finalized-owner provenance"
+        )
+
+        // Route correction and schema correction are separate bounded steps.
+        // A malformed forced call still gets the ordinary one structural fix.
+        harness.client.submitFunctionResult(
+            connectionID: correctedCall.connectionID,
+            callID: correctedCall.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"proposal_invalid","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .delegateRetry
+        )
+        harness.client.drainStateForVerification()
+        let schemaRepairs = harness.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else {
+                return false
+            }
+            return metadata["aurora_continuation"] as? String
+                == "delegate_task_schema_retry_once"
+        }
+        try expect(
+            schemaRepairs.count == 1,
+            "semantic route repair consumed or looped the corrected tool's schema budget"
+        )
+
+        // The two private repairs must also work in the reverse order. A
+        // malformed social proposal may be structurally repaired before its
+        // corrected typed domain reveals that the turn belongs to Codex.
+        let reverse = try makeHarness(toolsJSON: tools)
+        var reverseCalls: [RealtimeFunctionCall] = []
+        reverse.client.onFunctionCall = { reverseCalls.append($0) }
+        try committedTurn(
+            "reverse_repair_input",
+            responseID: "reverse_repair_initial",
+            harness: reverse,
+            transcript: "I want to work in the Aurora V4 project."
+        )
+        try deliver(responseDone(
+            id: "reverse_repair_initial",
+            status: "completed",
+            calls: [("reverse_bad_social", "conversation_move", #"{}"#)]
+        ), harness: reverse)
+        reverse.callbackQueue.sync {}
+        guard let reverseInitial = reverseCalls.first else {
+            throw VerificationFailure.failed(
+                "the reverse-order malformed social proposal was not delivered"
+            )
+        }
+        reverse.client.submitFunctionResult(
+            connectionID: reverseInitial.connectionID,
+            callID: reverseInitial.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"proposal_invalid","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .delegateRetry
+        )
+        reverse.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "reverse_repair_social_fixed", "status": "in_progress"],
+        ], harness: reverse)
+        try deliver(responseDone(
+            id: "reverse_repair_social_fixed",
+            status: "completed",
+            calls: [(
+                "reverse_social_fixed_call",
+                "conversation_move",
+                #"{"turn_domain":"codex_project_chat"}"#
+            )]
+        ), harness: reverse)
+        reverse.callbackQueue.sync {}
+        guard reverseCalls.count == 2 else {
+            throw VerificationFailure.failed(
+                "the reverse-order schema repair did not return to host validation"
+            )
+        }
+        let reverseCorrected = reverseCalls[1]
+        reverse.client.submitFunctionResult(
+            connectionID: reverseCorrected.connectionID,
+            callID: reverseCorrected.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"conversation_move_route_mismatch","semantic_retry_tool":"codex_project_chat","effect_verified":false,"external_side_effect":false}}"#,
+            continuation: .semanticRouteRetry(toolName: "codex_project_chat")
+        )
+        reverse.client.drainStateForVerification()
+        guard let reverseReroute = reverse.socket.sentEvents().last(where: { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else {
+                return false
+            }
+            return metadata["aurora_continuation"] as? String
+                == "semantic_route_retry_once"
+        })?["response"] as? [String: Any],
+        let reverseTools = reverseReroute["tools"] as? [[String: Any]] else {
+            throw VerificationFailure.failed(
+                "schema-first repair consumed the later semantic reroute"
+            )
+        }
+        try expect(
+            reverseTools.count == 1
+                && reverseTools[0]["name"] as? String == "codex_project_chat"
+                && reverseCorrected.authorizationSource == .directOwnerTurn,
+            "reverse-order route repair widened authority or exposed the wrong tool"
+        )
+    }
+
     private static func invalidCodexProjectChatRetriesOnceWithoutLosingOwnerAuthority() throws {
         let tools = #"[{"type":"function","name":"codex_project_chat","description":"Explicit Codex project navigation.","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":true}}]"#
         let harness = try makeHarness(toolsJSON: tools)
@@ -3854,6 +4052,149 @@ enum RealtimeVerification {
                 && diagnostics.contains("delegate_task_schema_retry_scheduled")
                 && diagnostics.contains("delegate_task_schema_retry_exhausted"),
             "Codex project schema repair was not bounded to one attempt"
+        )
+    }
+
+    private static func semanticRetryCannotLaunderContinuationAuthority() throws {
+        let helper = try makeHarness()
+        var helperCalls: [RealtimeFunctionCall] = []
+        helper.client.onFunctionCall = { helperCalls.append($0) }
+        try committedTurn(
+            "helper_launder_input",
+            responseID: "helper_launder_initial",
+            harness: helper,
+            transcript: "What do you remember about that project?"
+        )
+        try deliver(responseDone(
+            id: "helper_launder_initial",
+            status: "completed",
+            calls: [("helper_launder_memory", "memory_search", #"{"query":"project"}"#)]
+        ), harness: helper)
+        helper.callbackQueue.sync {}
+        guard let helperCall = helperCalls.first else {
+            throw VerificationFailure.failed("the helper provenance fixture did not call memory")
+        }
+        helper.client.submitFunctionResult(
+            connectionID: helperCall.connectionID,
+            callID: helperCall.callID,
+            output: #"{"ok":true,"output":"bounded observation"}"#
+        )
+        helper.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "helper_launder_followup", "status": "in_progress"],
+        ], harness: helper)
+        try deliver(responseDone(
+            id: "helper_launder_followup",
+            status: "completed",
+            calls: [(
+                "helper_launder_social",
+                "conversation_move",
+                #"{"turn_domain":"codex_project_chat"}"#
+            )]
+        ), harness: helper)
+        helper.callbackQueue.sync {}
+        guard helperCalls.count == 2 else {
+            throw VerificationFailure.failed("the helper continuation proposal was not delivered")
+        }
+        let helperProposal = helperCalls[1]
+        try expect(
+            helperProposal.authorizationSource == .toolContinuation,
+            "the helper observation fixture lost its restricted provenance"
+        )
+        let helperReroutesBefore = helper.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else { return false }
+            return metadata["aurora_continuation"] as? String
+                == "semantic_route_retry_once"
+        }.count
+        helper.client.submitFunctionResult(
+            connectionID: helperProposal.connectionID,
+            callID: helperProposal.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"conversation_move_route_mismatch","semantic_retry_tool":"codex_project_chat"}}"#,
+            continuation: .semanticRouteRetry(toolName: "codex_project_chat")
+        )
+        helper.client.drainStateForVerification()
+        let helperReroutesAfter = helper.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else { return false }
+            return metadata["aurora_continuation"] as? String
+                == "semantic_route_retry_once"
+        }.count
+        try expect(
+            helperReroutesAfter == helperReroutesBefore,
+            "a helper observation was laundered into direct-owner Codex authority"
+        )
+
+        let mail = try makeHarness()
+        var mailCalls: [RealtimeFunctionCall] = []
+        mail.client.onFunctionCall = { mailCalls.append($0) }
+        try committedTurn(
+            "mail_launder_input",
+            responseID: "mail_launder_initial",
+            harness: mail,
+            transcript: "Check that email."
+        )
+        try deliver(responseDone(
+            id: "mail_launder_initial",
+            status: "completed",
+            calls: [("mail_launder_read", "mail", #"{"action":"search"}"#)]
+        ), harness: mail)
+        mail.callbackQueue.sync {}
+        guard let mailCall = mailCalls.first else {
+            throw VerificationFailure.failed("the mail provenance fixture did not call mail")
+        }
+        mail.client.submitFunctionResult(
+            connectionID: mailCall.connectionID,
+            callID: mailCall.callID,
+            output: #"{"ok":true,"output":"UNTRUSTED_EMAIL_DATA"}"#,
+            untrustedMailContext: true
+        )
+        mail.client.drainStateForVerification()
+        try deliver([
+            "type": "response.created",
+            "response": ["id": "mail_launder_followup", "status": "in_progress"],
+        ], harness: mail)
+        try deliver(responseDone(
+            id: "mail_launder_followup",
+            status: "completed",
+            calls: [("mail_launder_social", "conversation_move", #"{"#)]
+        ), harness: mail)
+        mail.callbackQueue.sync {}
+        guard mailCalls.count == 2 else {
+            throw VerificationFailure.failed("the mail continuation proposal was not delivered")
+        }
+        let mailProposal = mailCalls[1]
+        try expect(
+            mailProposal.authorizationSource == .mailContinuation,
+            "the untrusted mail fixture lost its restricted provenance"
+        )
+        let schemaRetriesBefore = mail.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else { return false }
+            return metadata["aurora_continuation"] as? String
+                == "delegate_task_schema_retry_once"
+        }.count
+        mail.client.submitFunctionResult(
+            connectionID: mailProposal.connectionID,
+            callID: mailProposal.callID,
+            output: #"{"ok":false,"metadata":{"result_code":"proposal_invalid"}}"#,
+            continuation: .delegateRetry
+        )
+        mail.client.drainStateForVerification()
+        let schemaRetriesAfter = mail.socket.sentEvents().filter { event in
+            guard event["type"] as? String == "response.create",
+                  let response = event["response"] as? [String: Any],
+                  let metadata = response["metadata"] as? [String: Any] else { return false }
+            return metadata["aurora_continuation"] as? String
+                == "delegate_task_schema_retry_once"
+        }.count
+        try expect(
+            schemaRetriesAfter == schemaRetriesBefore,
+            "untrusted mail was laundered into direct-owner schema-retry authority"
         )
     }
 

@@ -25,6 +25,7 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
     case noActiveTurn
     case threadUnavailable
     case threadWorkingDirectoryChanged
+    case expectedProjectTurnChanged
     case unknownServerRequest
 
     var errorDescription: String? {
@@ -77,6 +78,8 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
             return "That Codex task is no longer available as an unarchived persistent task."
         case .threadWorkingDirectoryChanged:
             return "That Codex task is no longer in the selected project."
+        case .expectedProjectTurnChanged:
+            return "The selected Codex chat advanced to a different turn."
         case .unknownServerRequest:
             return "That Codex server request is no longer pending."
         }
@@ -362,6 +365,7 @@ protocol AuroraCodexAppAPI: Sendable {
     func reconcileExactProjectThread(
         taskID: String,
         threadID: String,
+        expectedTurnID: String?,
         expectedWorkingDirectory: URL
     ) async throws -> CodexDelegateTaskReconciliation
     /// Continues a completed thread as a new turn, or steers the currently
@@ -556,6 +560,15 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
     /// settings. Their expected cwd is a resource identity check, not a
     /// thread/resume override.
     private var preservedThreadWorkingDirectories: [String: URL] = [:]
+    /// Existing project chats are observed only for the exact turn Aurora
+    /// durably executor-bound. Later turns in the same shared chat belong to
+    /// their own authorization and may never inherit this task identity.
+    private var expectedProjectTurnByTask: [String: String] = [:]
+    /// A reused selected chat can emit its new turn before turn/start returns.
+    /// Hold only those mismatching notifications while that exact dispatch is
+    /// pending, then replay the ones whose turn matches the returned handle.
+    private var pendingRawProjectDispatchTaskIDs = Set<String>()
+    private var deferredRawProjectEventsByTask: [String: [CodexTaskRuntimeEvent]] = [:]
     private var loadedThreadIDs = Set<String>()
     private var activeTurnByTask: [String: String] = [:]
     private var busyTaskIDs = Set<String>()
@@ -855,7 +868,9 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
         // `startTask` transmits input byte-for-byte. This constrained entry
         // point prevents the delegated-task developer prompt and receipt tools
         // from leaking into an explicitly owner-directed Codex conversation.
-        return try await startTask(taskID: taskID, input: input, options: options)
+        let handle = try await startTask(taskID: taskID, input: input, options: options)
+        expectedProjectTurnByTask[taskID] = handle.turnID
+        return handle
     }
 
     func sendRawProjectMessage(
@@ -967,10 +982,14 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
     func reconcileExactProjectThread(
         taskID: String,
         threadID: String,
+        expectedTurnID: String? = nil,
         expectedWorkingDirectory: URL
     ) async throws -> CodexDelegateTaskReconciliation {
         try Self.validateTaskID(taskID)
         try Self.validateOpaqueID(threadID, failure: .invalidThreadIdentifier)
+        if let expectedTurnID {
+            try Self.validateOpaqueID(expectedTurnID)
+        }
         let expectedDirectory = expectedWorkingDirectory.standardizedFileURL
         guard expectedDirectory.isFileURL,
               expectedDirectory.path.hasPrefix("/"),
@@ -994,6 +1013,10 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
             thread: threadSummary,
             latestTurn: latestTurn
         )
+        if let expectedTurnID,
+           observation.latestTurnID != expectedTurnID {
+            throw CodexTaskRuntimeError.expectedProjectTurnChanged
+        }
         try validatePreservingThreadBinding(
             taskID: taskID,
             threadID: threadID,
@@ -1011,13 +1034,6 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
                 expectedWorkingDirectory: expectedDirectory
             )
         }
-        try bindPreservingThreadSettings(
-            taskID: taskID,
-            to: threadID,
-            expectedWorkingDirectory: expectedDirectory
-        )
-        synchronizeReconciledTurn(observation, taskID: taskID)
-
         if observation.status == .running, observation.latestTurnID != nil {
             // Close read→subscribe races. Completion before resume is captured
             // here; completion after this read arrives through the now-bound
@@ -1034,8 +1050,18 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
                 thread: threadSummary,
                 latestTurn: latestTurn
             )
-            synchronizeReconciledTurn(observation, taskID: taskID)
+            if let expectedTurnID,
+               observation.latestTurnID != expectedTurnID {
+                throw CodexTaskRuntimeError.expectedProjectTurnChanged
+            }
         }
+        try bindPreservingThreadSettings(
+            taskID: taskID,
+            to: threadID,
+            expectedWorkingDirectory: expectedDirectory,
+            expectedTurnID: expectedTurnID
+        )
+        synchronizeReconciledTurn(observation, taskID: taskID)
         return observation
     }
 
@@ -1742,8 +1768,15 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
             ]
             // Intentionally no effort/model/instructions override: this is a
             // user-selected Codex conversation, not an Aurora-owned worker.
+            pendingRawProjectDispatchTaskIDs.insert(taskID)
+            defer {
+                pendingRawProjectDispatchTaskIDs.remove(taskID)
+                deferredRawProjectEventsByTask.removeValue(forKey: taskID)
+            }
             let result = try await rpc(method: "turn/start", params: params)
             let turnID = try Self.turnID(from: result)
+            expectedProjectTurnByTask[taskID] = turnID
+            replayDeferredRawProjectEvents(taskID: taskID, acceptedTurnID: turnID)
             if !recentlyCompletedTurnIDs.contains(turnID) {
                 activeTurnByTask[taskID] = turnID
             }
@@ -1760,6 +1793,7 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
             guard returnedTurnID == turnID else {
                 throw CodexTaskRuntimeError.protocolViolation
             }
+            expectedProjectTurnByTask[taskID] = turnID
             return CodexTaskHandle(taskID: taskID, threadID: threadID, turnID: turnID)
         }
     }
@@ -1968,7 +2002,17 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
         let turnID = Self.eventTurnID(params)
         if let threadID { try Self.validateOpaqueID(threadID) }
         if let turnID { try Self.validateOpaqueID(turnID) }
-        let taskID = threadID.flatMap { threadTasks[$0] }
+        let mappedTaskID = threadID.flatMap { threadTasks[$0] }
+        var deferredRawProjectTaskID: String?
+        let taskID = mappedTaskID.flatMap { taskID -> String? in
+            guard let expectedTurnID = expectedProjectTurnByTask[taskID],
+                  let turnID else { return taskID }
+            if turnID == expectedTurnID { return taskID }
+            if pendingRawProjectDispatchTaskIDs.contains(taskID) {
+                deferredRawProjectTaskID = taskID
+            }
+            return nil
+        }
         if method == "thread/settings/updated",
            let threadID,
            let options = threadOptions[threadID] {
@@ -1993,6 +2037,42 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
                 verifiedChatGPTAccountGeneration = nil
                 throw CodexTaskRuntimeError.chatGPTLoginRequired
             }
+        }
+        if let deferredRawProjectTaskID,
+           !message.keys.contains("id") {
+            // Only lifecycle edges are required to close the handle race.
+            // Item streams are intentionally dropped here; exact terminal
+            // reconciliation remains the fallback for an oversized event.
+            guard method == "turn/started" || method == "turn/completed" else {
+                return
+            }
+            var events = deferredRawProjectEventsByTask[deferredRawProjectTaskID] ?? []
+            let bufferedBytes = events.reduce(0) { $0 + $1.paramsJSON.count }
+            let maximumDeferredBytes = min(
+                configuration.maximumBufferedInboundBytes,
+                4 * 1_024 * 1_024
+            )
+            guard events.count < 8,
+                  bufferedBytes <= maximumDeferredBytes - min(
+                    paramsJSON.count,
+                    maximumDeferredBytes
+                  ),
+                  paramsJSON.count <= maximumDeferredBytes else {
+                pendingRawProjectDispatchTaskIDs.remove(deferredRawProjectTaskID)
+                deferredRawProjectEventsByTask.removeValue(forKey: deferredRawProjectTaskID)
+                return
+            }
+            events.append(CodexTaskRuntimeEvent(
+                kind: .notification,
+                method: method,
+                taskID: deferredRawProjectTaskID,
+                threadID: threadID,
+                turnID: turnID,
+                serverRequestID: nil,
+                paramsJSON: paramsJSON
+            ))
+            deferredRawProjectEventsByTask[deferredRawProjectTaskID] = events
+            return
         }
         updateTaskState(method: method, taskID: taskID, threadID: threadID, turnID: turnID)
 
@@ -2057,9 +2137,26 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
             threadTasks.removeValue(forKey: threadID)
             threadOptions.removeValue(forKey: threadID)
             preservedThreadWorkingDirectories.removeValue(forKey: threadID)
+            expectedProjectTurnByTask.removeValue(forKey: taskID)
             loadedThreadIDs.remove(threadID)
             activeTurnByTask.removeValue(forKey: taskID)
             expireServerRequests(taskID: taskID, turnID: nil)
+        }
+    }
+
+    private func replayDeferredRawProjectEvents(
+        taskID: String,
+        acceptedTurnID: String
+    ) {
+        let events = deferredRawProjectEventsByTask.removeValue(forKey: taskID) ?? []
+        for event in events where event.turnID == acceptedTurnID {
+            updateTaskState(
+                method: event.method,
+                taskID: taskID,
+                threadID: event.threadID,
+                turnID: event.turnID
+            )
+            emit(event)
         }
     }
 
@@ -2140,6 +2237,8 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
         loadedThreadIDs.removeAll()
         activeTurnByTask.removeAll()
         pendingServerRequests.removeAll()
+        pendingRawProjectDispatchTaskIDs.removeAll()
+        deferredRawProjectEventsByTask.removeAll()
         accountSnapshot = nil
         verifiedChatGPTAccountGeneration = nil
         let pending = pendingRPCs.values
@@ -2193,7 +2292,8 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
     private func bindPreservingThreadSettings(
         taskID: String,
         to threadID: String,
-        expectedWorkingDirectory: URL
+        expectedWorkingDirectory: URL,
+        expectedTurnID: String? = nil
     ) throws {
         try validatePreservingThreadBinding(
             taskID: taskID,
@@ -2203,6 +2303,9 @@ actor CodexTaskRuntime: AuroraCodexAppAPI {
         taskThreads[taskID] = threadID
         threadTasks[threadID] = taskID
         preservedThreadWorkingDirectories[threadID] = expectedWorkingDirectory
+        if let expectedTurnID {
+            expectedProjectTurnByTask[taskID] = expectedTurnID
+        }
     }
 
     private func validatePreservingThreadBinding(

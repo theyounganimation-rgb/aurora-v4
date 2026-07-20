@@ -71,9 +71,13 @@ public actor ToolRegistry {
         CodexProjectChatProposal.realtimeFunctionSchema,
         RealtimeFunctionSchema(
             name: "conversation_move",
-            description: "Required before every ordinary social reply. Resolve what the person actually did in this turn, propose one authored conversational move, optionally revise Aurora's grounded point of view, and capture meaningful owner learning. Do not speak before this function. Ordinary external work uses delegate_task; explicit navigation or messaging inside a named Codex project/chat uses codex_project_chat; unmistakable background audio uses wait_for_user.",
+            description: "Required before every ordinary social reply and never valid for an external action or named Codex project/chat request. Truthfully classify turn_domain even when that makes this function the wrong route. A desire to work in, open, select, inspect, continue, or message a named Codex project/chat uses codex_project_chat even before the owner supplies the eventual work message. Other external work uses delegate_task; unmistakable background audio uses wait_for_user. Do not speak before the correct function.",
             parameters: objectSchema(
                 properties: [
+                    "turn_domain": enumStringSchema(
+                        "Truthful semantic domain of the finalized owner turn, independent of the function currently being called. social is ordinary conversation; delegated_action is external work; codex_project_chat is any navigation, status, selection, or relay involving a named Codex project or chat.",
+                        values: ConversationTurnDomain.allCases.map(\.rawValue)
+                    ),
                     "perceived_turn": enumStringSchema(
                         "The conversational act heard in the current audio, not a phrase match.",
                         values: [
@@ -199,7 +203,7 @@ public actor ToolRegistry {
                     ),
                 ],
                 required: [
-                    "perceived_turn", "interaction_kind", "proposed_move",
+                    "turn_domain", "perceived_turn", "interaction_kind", "proposed_move",
                     "answer_degree", "aurora_first_person_position", "private_rationale", "record_ids",
                     "record_updates", "understanding_updates",
                 ]
@@ -336,6 +340,19 @@ public actor ToolRegistry {
         result: ToolExecutionResult,
         turnAlreadySpoke: Bool = false
     ) -> RealtimeToolContinuation {
+        if toolName == "conversation_move",
+           result.metadata["result_code"]?.stringValue
+            == "conversation_move_route_mismatch",
+           let retryTool = result.metadata["semantic_retry_tool"]?.stringValue,
+           retryTool == "delegate_task" || retryTool == "codex_project_chat" {
+            return turnAlreadySpoke
+                ? .complete
+                : .semanticRouteRetry(toolName: retryTool)
+        }
+        if toolName == "conversation_move",
+           result.metadata["result_code"]?.stringValue == "proposal_invalid" {
+            return turnAlreadySpoke ? .complete : .delegateRetry
+        }
         if toolName == "conversation_move" {
             // The result is private conversational direction, never a task
             // receipt. If audio from the planning response already crossed
@@ -377,12 +394,18 @@ public actor ToolRegistry {
         }
         if toolName == "codex_project_chat" {
             let resultCode = result.metadata["result_code"]?.stringValue
+            let taskStillRunning = result.metadata["background_task"]?.boolValue == true
             if resultCode == "proposal_invalid" {
                 return turnAlreadySpoke ? .complete : .delegateRetry
             }
             if result.ok,
-               resultCode == CodexProjectChatResultCode.accepted.rawValue {
+               resultCode == CodexProjectChatResultCode.accepted.rawValue,
+               taskStillRunning {
                 return turnAlreadySpoke ? .complete : .delegateAccepted
+            }
+            if result.ok,
+               resultCode == CodexProjectChatResultCode.accepted.rawValue {
+                return .complete
             }
             return turnAlreadySpoke ? .complete : .speak
         }
@@ -827,14 +850,12 @@ public actor ToolRegistry {
         context: ToolInvocationContext
     ) throws -> ConversationMoveToolProposal {
         let requiredFields: Set<String> = [
-            "perceived_turn", "interaction_kind", "proposed_move",
+            "turn_domain", "perceived_turn", "interaction_kind", "proposed_move",
             "answer_degree", "aurora_first_person_position", "private_rationale", "record_ids",
             "record_updates", "understanding_updates",
         ]
         let allowedFields = requiredFields.union(["disclosure_record_id"])
-        guard requiredFields.isSubset(of: Set(arguments.keys)),
-              Set(arguments.keys).isSubset(of: allowedFields),
-              context.hasTrustedCurrentAudio,
+        guard context.hasTrustedCurrentAudio,
               context.sourceTurnFinalized,
               (context.authorizationSource == .directOwnerTurn
                 || context.authorizationSource == .toolContinuation),
@@ -842,7 +863,16 @@ public actor ToolRegistry {
               context.latestUserTranscript?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
             throw ToolRegistryError.ownerRequestUnavailable
         }
+        guard requiredFields.isSubset(of: Set(arguments.keys)),
+              Set(arguments.keys).isSubset(of: allowedFields) else {
+            throw ToolRegistryError.invalidArgument("conversation_move")
+        }
 
+        guard let turnDomain = ConversationTurnDomain(rawValue: try requiredString(
+            "turn_domain", in: arguments, maximumCharacters: 48
+        )) else {
+            throw ToolRegistryError.invalidArgument("conversation_move")
+        }
         let perceivedTurn = try requiredString(
             "perceived_turn", in: arguments, maximumCharacters: 48
         )
@@ -940,6 +970,7 @@ public actor ToolRegistry {
         }
 
         return ConversationMoveToolProposal(
+            turnDomain: turnDomain,
             perceivedTurn: perceivedTurn,
             interactionKind: interactionKind,
             proposedMove: proposedMove,
@@ -1809,7 +1840,21 @@ public actor ToolRegistry {
 
     private func invalidResult(name: String, error: Error) -> ToolExecutionResult {
         let metadata: [String: ToolJSONValue]
-        if name == "delegate_task" || name == "codex_project_chat" {
+        let conversationProposalInvalid: Bool
+        if name == "conversation_move",
+           let registryError = error as? ToolRegistryError {
+            switch registryError {
+            case .malformedArguments, .missingArgument, .invalidArgument:
+                conversationProposalInvalid = true
+            default:
+                conversationProposalInvalid = false
+            }
+        } else {
+            conversationProposalInvalid = false
+        }
+        if name == "delegate_task"
+            || name == "codex_project_chat"
+            || conversationProposalInvalid {
             metadata = [
                 "result_code": .string("proposal_invalid"),
                 "effect_verified": .bool(false),

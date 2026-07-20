@@ -226,6 +226,7 @@ protocol CodexDelegateTaskRunning: Sendable {
     func reconcileExactProjectThread(
         taskID: String,
         threadID: String,
+        expectedTurnID: String?,
         expectedWorkingDirectory: URL
     ) async throws -> CodexDelegateTaskReconciliation
     func supportsDetachedTaskPersistence() async throws -> Bool
@@ -257,6 +258,7 @@ extension CodexDelegateTaskRunning {
     func reconcileExactProjectThread(
         taskID _: String,
         threadID _: String,
+        expectedTurnID _: String?,
         expectedWorkingDirectory _: URL
     ) async throws -> CodexDelegateTaskReconciliation {
         throw CodexTaskRuntimeError.processUnavailable
@@ -436,6 +438,14 @@ actor DelegateTaskCoordinator {
     private var inFlightProjectChatRequests: [String: InFlightProjectChatRequest] = [:]
     private var projectChatDispatchTail: Task<Void, Never>?
     private var projectChatDispatchTailToken: UUID?
+    private struct PendingProjectChatRuntimeEvents {
+        let operationID: String
+        var events: [CodexTaskRuntimeEvent]
+    }
+    /// Runtime events may beat send/steer's handle. Until that handle binds
+    /// the latest authorization to one exact turn, the events are observations
+    /// only and cannot mutate the new operation's durable truth.
+    private var pendingProjectChatRuntimeEventsByTask: [String: PendingProjectChatRuntimeEvents] = [:]
     private var requestResults: [String: DelegateTaskCoordinatorResult] = [:]
     private var requestOrder: [String] = []
     private struct StartAuthorizationScope: Equatable {
@@ -471,8 +481,13 @@ actor DelegateTaskCoordinator {
     /// mapped persistent Codex turn stopped in the shared daemon.
     private var runtimeObservationLostTaskIDs = Set<String>()
     private var eventHandler: EventHandler?
-    private var runtimeEventContinuation: AsyncStream<CodexTaskRuntimeEvent>.Continuation?
+    private enum RuntimeEventQueueItem: Sendable {
+        case event(CodexTaskRuntimeEvent)
+        case barrier(UUID)
+    }
+    private var runtimeEventContinuation: AsyncStream<RuntimeEventQueueItem>.Continuation?
     private var runtimeEventConsumerTask: Task<Void, Never>?
+    private var runtimeEventBarrierWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var eventDeliveryTail: Task<Void, Never>?
     /// app-server may omit all items from turn/completed after streaming them
     /// separately. Bind the public agent result to the exact task/thread/turn
@@ -543,14 +558,18 @@ actor DelegateTaskCoordinator {
                     ?? (state.projectChatFocus == nil ? 0 : 1)
                 var seenTaskIDs = Set<String>()
                 var seenThreadIDs = Set<String>()
+                var repairedProjectChatProvenance = false
                 for persisted in state.records {
                     guard seenTaskIDs.insert(persisted.taskID).inserted,
-                          let restored = Self.restoreRecord(
+                          var restored = Self.restoreRecord(
                             persisted,
                             homeDirectory: standardizedHome
                           ),
                           restored.codexThreadID.map({ seenThreadIDs.insert($0).inserted })
                             ?? true else { throw DelegateTaskStoreError.corruptState }
+                    if Self.repairImpossibleProjectChatReconciliation(in: &restored) {
+                        repairedProjectChatProvenance = true
+                    }
                     records[restored.taskID] = restored
                     if restored.isProjectChat { continue }
                     if let priorID = latestTaskBySession[restored.sessionID],
@@ -558,6 +577,16 @@ actor DelegateTaskCoordinator {
                         continue
                     }
                     latestTaskBySession[restored.sessionID] = restored.taskID
+                }
+                if repairedProjectChatProvenance {
+                    try store.save(DelegateTaskPersistedState(
+                        records: records.values
+                            .sorted(by: { $0.updatedAt > $1.updatedAt })
+                            .prefix(128)
+                            .map(Self.persistedRecord),
+                        projectChatFocus: projectChatFocus,
+                        projectChatGeneration: projectChatGeneration
+                    ))
                 }
             } else if let candidate = legacyRecovery?.discoverLatest() {
                 let migrated = Record(
@@ -648,10 +677,10 @@ actor DelegateTaskCoordinator {
         } else {
             ordinaryContext = "No delegated Codex task is currently recorded."
         }
-        return ordinaryContext + "\n" + Self.projectChatFocusContext(
+        return Self.projectChatFocusContext(
             projectChatFocus,
             record: projectChatFocus?.taskID.flatMap { records[$0] }
-        )
+        ) + "\n" + ordinaryContext
     }
 
     func hasActiveTask() -> Bool {
@@ -1451,6 +1480,11 @@ actor DelegateTaskCoordinator {
         var record: Record
         if var current = existingRecord {
             current.revision += 1
+            // The prior turn belongs to the prior authorized operation. A new
+            // relay is unbound until sendExactMessage returns (or an exact
+            // runtime event binds its turn), so reconciliation can never adopt
+            // an unrelated latest turn from the selected chat.
+            current.codexTurnID = nil
             current.sourceTurnIDs = Array(
                 (current.sourceTurnIDs + [authorization.sourceTurnID]).suffix(16)
             )
@@ -1599,6 +1633,13 @@ actor DelegateTaskCoordinator {
             }
             projectChatFocus = acceptedFocus
             let retained = persistState()
+            await drainRuntimeEvents()
+            await replayPendingProjectChatRuntimeEvents(
+                taskID: taskID,
+                operationID: authorization.requestID,
+                acceptedTurnID: handle.turnID
+            )
+            let stillRunning = records[taskID]?.status.isTerminal == false
             let runtime = self.runtime
             Task { _ = await runtime.openThreadInDesktop(threadID: handle.threadID) }
             return CodexProjectChatResult(
@@ -1609,9 +1650,11 @@ actor DelegateTaskCoordinator {
                     : "The owner's message was sent, but its local continuity record could not be saved to disk.",
                 threadID: handle.threadID,
                 taskID: taskID,
-                backgroundTask: true
+                backgroundTask: stillRunning
             )
         } catch {
+            await drainRuntimeEvents()
+            pendingProjectChatRuntimeEventsByTask.removeValue(forKey: taskID)
             let acceptanceUnknown = Self.isAmbiguousProjectChatDispatchFailure(error)
             let explicitRejection = Self.isExplicitProjectChatRejection(error)
             let terminalSummary = explicitRejection
@@ -1627,7 +1670,7 @@ actor DelegateTaskCoordinator {
                         to: &failed,
                         operationID: operationID,
                         event: .failed,
-                        codexTurnID: failed.codexTurnID,
+                        codexTurnID: nil,
                         executorStatus: .failed,
                         resultSummary: summary,
                         recordedAt: Date()
@@ -2397,11 +2440,10 @@ actor DelegateTaskCoordinator {
             )
         }
         let focusedRecord = projectChatFocus?.taskID.flatMap { records[$0] }
-        return (ordinaryContext ?? "No delegated Codex task is currently recorded.")
-            + "\n" + Self.projectChatFocusContext(
-                projectChatFocus,
-                record: focusedRecord
-            )
+        return Self.projectChatFocusContext(
+            projectChatFocus,
+            record: focusedRecord
+        ) + "\n" + (ordinaryContext ?? "No delegated Codex task is currently recorded.")
     }
 
     func cancelActiveAndWait(matchingSessionID sessionID: String) async {
@@ -2440,7 +2482,10 @@ actor DelegateTaskCoordinator {
         let consumer = runtimeEventConsumerTask
         runtimeEventConsumerTask = nil
         await consumer?.value
+        for waiter in runtimeEventBarrierWaiters.values { waiter.resume() }
+        runtimeEventBarrierWaiters.removeAll()
         runtimeHandlerInstalled = false
+        pendingProjectChatRuntimeEventsByTask.removeAll()
         await eventDeliveryTail?.value
         eventDeliveryTail = nil
         streamedAgentMessages.removeAll()
@@ -2628,20 +2673,46 @@ actor DelegateTaskCoordinator {
     private func ensureRuntimeHandler() async {
         guard !runtimeHandlerInstalled else { return }
         runtimeHandlerInstalled = true
-        let (stream, continuation) = AsyncStream<CodexTaskRuntimeEvent>.makeStream()
+        let (stream, continuation) = AsyncStream<RuntimeEventQueueItem>.makeStream()
         runtimeEventContinuation = continuation
         runtimeEventConsumerTask = Task { [weak self] in
-            for await event in stream {
+            for await item in stream {
                 guard !Task.isCancelled else { return }
-                await self?.acceptRuntimeEvent(event)
+                switch item {
+                case .event(let event):
+                    await self?.acceptRuntimeEvent(event)
+                case .barrier(let id):
+                    await self?.completeRuntimeEventBarrier(id)
+                }
             }
         }
         await runtime.setEventHandler { event in
             // The runtime invokes this callback synchronously in wire order.
             // AsyncStream preserves that order while crossing into this actor;
             // one detached Task per event would not.
-            continuation.yield(event)
+            continuation.yield(.event(event))
         }
+    }
+
+    private func drainRuntimeEvents() async {
+        guard runtimeHandlerInstalled,
+              let continuation = runtimeEventContinuation else { return }
+        let id = UUID()
+        await withCheckedContinuation { waiter in
+            runtimeEventBarrierWaiters[id] = waiter
+            switch continuation.yield(.barrier(id)) {
+            case .enqueued:
+                break
+            case .dropped, .terminated:
+                runtimeEventBarrierWaiters.removeValue(forKey: id)?.resume()
+            @unknown default:
+                runtimeEventBarrierWaiters.removeValue(forKey: id)?.resume()
+            }
+        }
+    }
+
+    private func completeRuntimeEventBarrier(_ id: UUID) {
+        runtimeEventBarrierWaiters.removeValue(forKey: id)?.resume()
     }
 
     private func acceptRuntimeEvent(_ event: CodexTaskRuntimeEvent) async {
@@ -2711,6 +2782,41 @@ actor DelegateTaskCoordinator {
         guard let taskID = event.taskID,
               var record = records[taskID],
               !record.status.isTerminal else { return }
+        if record.isProjectChat {
+            guard let operationID = Self.latestAuthorizedOperationID(in: record) else {
+                return
+            }
+            guard let boundTurnID = Self.uniquelyBoundTurnID(
+                in: record,
+                operationID: operationID
+            ) else {
+                guard event.turnID != nil,
+                      event.method == "turn/started"
+                        || event.method == "turn/completed" else { return }
+                var pending = pendingProjectChatRuntimeEventsByTask[taskID]
+                if pending?.operationID != operationID {
+                    pending = PendingProjectChatRuntimeEvents(
+                        operationID: operationID,
+                        events: []
+                    )
+                }
+                guard var pending else { return }
+                let bufferedBytes = pending.events.reduce(0) {
+                    $0 + $1.paramsJSON.count
+                }
+                let maximumBufferedBytes = 4 * 1_024 * 1_024
+                guard pending.events.count < 8,
+                      event.paramsJSON.count <= maximumBufferedBytes,
+                      bufferedBytes <= maximumBufferedBytes - event.paramsJSON.count else {
+                    pendingProjectChatRuntimeEventsByTask.removeValue(forKey: taskID)
+                    return
+                }
+                pending.events.append(event)
+                pendingProjectChatRuntimeEventsByTask[taskID] = pending
+                return
+            }
+            guard event.turnID == boundTurnID else { return }
+        }
         runtimeObservationLostTaskIDs.remove(taskID)
         // Preserve the exact app-server thread identity as soon as any bound
         // turn event arrives. This also covers a very fast turn that completes
@@ -2925,6 +3031,19 @@ actor DelegateTaskCoordinator {
             if bindingOrKnowledgeChanged {
                 persistState()
             }
+        }
+    }
+
+    private func replayPendingProjectChatRuntimeEvents(
+        taskID: String,
+        operationID: String,
+        acceptedTurnID: String
+    ) async {
+        guard let pending = pendingProjectChatRuntimeEventsByTask.removeValue(
+            forKey: taskID
+        ), pending.operationID == operationID else { return }
+        for event in pending.events where event.turnID == acceptedTurnID {
+            await acceptRuntimeEvent(event)
         }
     }
 
@@ -3229,26 +3348,35 @@ actor DelegateTaskCoordinator {
         expectedWorkingDirectory: URL
     ) async {
         guard let original = records[taskID],
-              let threadID = original.codexThreadID else { return }
+              let threadID = original.codexThreadID,
+              let operationID = Self.latestAuthorizedOperationID(in: original),
+              let expectedTurnID = Self.uniquelyBoundTurnID(
+                in: original,
+                operationID: operationID
+              ) else { return }
         do {
             let observation = try await runtime.reconcileExactProjectThread(
                 taskID: taskID,
                 threadID: threadID,
+                expectedTurnID: expectedTurnID,
                 expectedWorkingDirectory: expectedWorkingDirectory
             )
             guard observation.threadID == threadID,
                   var record = records[taskID] else { return }
-            let priorStatus = record.status
-            let turnChanged = observation.latestTurnID.map {
-                $0 != record.codexTurnID
-            } ?? false
-            if turnChanged {
-                record.resultSummary = nil
-                record.resultReport = nil
-                record.effectVerified = false
-                record.stepCount = 0
+            guard observation.latestTurnID == expectedTurnID else {
+                // A selected Codex chat is a resource, not blanket authority
+                // over every later turn in that thread. Preserve the exact
+                // Aurora-bound operation and never adopt unrelated work.
+                if !record.status.isTerminal {
+                    record.statusKnowledge = .lastKnown
+                    record.updatedAt = Date()
+                    records[taskID] = record
+                    persistState()
+                }
+                return
             }
-            record.codexTurnID = observation.latestTurnID ?? record.codexTurnID
+            let priorStatus = record.status
+            record.codexTurnID = expectedTurnID
             if let observedStatus = observation.status {
                 record.statusKnowledge = .live
                 switch observedStatus {
@@ -3425,6 +3553,50 @@ actor DelegateTaskCoordinator {
         return restored
     }
 
+    /// Repairs the impossible state written by older project-chat
+    /// reconciliation: a terminal event adopted a non-nil turn that was never
+    /// executor-bound to that operation. This is causal ledger validation, not
+    /// interpretation of task text, and leaves explicit nil-turn rejections
+    /// and every valid bound terminal untouched.
+    private static func repairImpossibleProjectChatReconciliation(
+        in record: inout Record
+    ) -> Bool {
+        guard record.isProjectChat else { return false }
+        let boundPairs = Set(record.operationLedger.compactMap { entry -> String? in
+            guard entry.event == .executorBound,
+                  let turnID = entry.codexTurnID else { return nil }
+            return "\(entry.operationID)\u{1f}\(turnID)"
+        })
+        var repaired = false
+        let retained = record.operationLedger.filter { entry in
+            guard entry.event.isTerminal,
+                  let turnID = entry.codexTurnID,
+                  !boundPairs.contains("\(entry.operationID)\u{1f}\(turnID)") else {
+                return true
+            }
+            repaired = true
+            return false
+        }
+        guard repaired else { return false }
+        record.operationLedger = retained
+        if let operationID = latestAuthorizedOperationID(in: record) {
+            record.codexTurnID = uniquelyBoundTurnID(
+                in: record,
+                operationID: operationID
+            )
+        } else {
+            record.codexTurnID = nil
+        }
+        record.resultSummary = nil
+        record.resultReport = nil
+        record.effectVerified = false
+        record.stepCount = 0
+        record.status = .running
+        record.statusKnowledge = .lastKnown
+        projectLatestTerminalTruth(into: &record)
+        return true
+    }
+
     private static func safeWorkspaceURL(path: String, homeDirectory: URL) -> URL? {
         let candidate = URL(fileURLWithPath: path).standardizedFileURL
             .resolvingSymlinksInPath()
@@ -3554,13 +3726,13 @@ actor DelegateTaskCoordinator {
             let work: String
             if let record {
                 let result = record.resultSummary.map {
-                    " Latest private result: \(boundedNaturalResult($0, maximum: 320))"
+                    " Latest private result: \(boundedNaturalResult($0, maximum: 240))"
                 } ?? ""
-                work = " Its \(record.statusKnowledge == .live ? "live" : "last-known") work state is \(record.status.rawValue).\(result)"
+                work = " Last known relay state: \(record.status.rawValue).\(result) Use codex_project_chat status if {{owner}} asks for current details."
             } else {
                 work = ""
             }
-            return "Explicit Codex focus: chat ‘\(chat)’ in \(boundedOneLine(focus.projectName, maximum: 220)).\(work) While the owner is working in this selected chat, relay each work message through codex_project_chat relay exactly; do not wrap, summarize, or reroute it through delegate_task. Unrelated ordinary tasks remain on delegate_task."
+            return "Explicit Codex focus: chat ‘\(chat)’ in \(boundedOneLine(focus.projectName, maximum: 220)). Any owner turn naming this project/chat, choosing it, checking it, or continuing its work must use codex_project_chat. Relay each work message through codex_project_chat exactly; never route that turn through conversation_move or delegate_task.\(work) Unrelated ordinary tasks still use delegate_task."
         }
     }
 
@@ -4083,6 +4255,22 @@ actor DelegateTaskCoordinator {
             $0.event == .authorized
                 && ($0.operation == .start || $0.operation == .update)
         })?.operationID
+    }
+
+    /// Project-chat reconciliation may observe only the exact turn returned
+    /// for the latest authorized relay. Thread-latest is resource state, not an
+    /// execution binding, and can include unrelated manual/Codex app work.
+    private static func uniquelyBoundTurnID(
+        in record: Record,
+        operationID: String
+    ) -> String? {
+        let turnIDs = Set(record.operationLedger.compactMap { entry -> String? in
+            guard entry.operationID == operationID,
+                  entry.event == .executorBound else { return nil }
+            return entry.codexTurnID
+        })
+        guard turnIDs.count == 1 else { return nil }
+        return turnIDs.first
     }
 
     /// Reconciliation lacks the live event boundary that normally binds each

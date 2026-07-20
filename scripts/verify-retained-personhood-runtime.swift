@@ -8,6 +8,7 @@ enum RealtimeToolContinuation: Equatable {
     case speak
     case delegateAccepted
     case delegateRetry
+    case semanticRouteRetry(toolName: String)
     case conversationMove
     case silent
     case complete
@@ -64,7 +65,57 @@ enum RetainedPersonhoodRuntimeVerifier {
                     ) == .complete,
                 "schema-invalid delegated work did not receive one private repair opportunity"
             )
-            print(#"{"ok":true,"checks":{"conversationMoveAlreadySpokenCompletesSilently":true,"invalidDelegateRetriesPrivatelyOnce":true}}"#)
+            try expect(
+                ToolRegistry.continuation(
+                    for: "conversation_move",
+                    result: invalidDelegate,
+                    turnAlreadySpoke: false
+                ) == .delegateRetry
+                    && ToolRegistry.continuation(
+                        for: "conversation_move",
+                        result: invalidDelegate,
+                        turnAlreadySpoke: true
+                    ) == .complete,
+                "schema-invalid social intent could still leak validation language into speech"
+            )
+            let projectMisroute = ToolExecutionResult(
+                ok: false,
+                output: "private route correction",
+                metadata: [
+                    "result_code": .string("conversation_move_route_mismatch"),
+                    "semantic_retry_tool": .string("codex_project_chat"),
+                ]
+            )
+            try expect(
+                ToolRegistry.continuation(
+                    for: "conversation_move",
+                    result: projectMisroute,
+                    turnAlreadySpoke: false
+                ) == .semanticRouteRetry(toolName: "codex_project_chat")
+                    && ToolRegistry.continuation(
+                        for: "conversation_move",
+                        result: projectMisroute,
+                        turnAlreadySpoke: true
+                    ) == .complete,
+                "a typed Codex project/chat turn could still fall through to social speech"
+            )
+            let fastProjectCompletion = ToolExecutionResult(
+                ok: true,
+                output: "The selected Codex turn already completed.",
+                metadata: [
+                    "result_code": .string("accepted"),
+                    "background_task": .bool(false),
+                ]
+            )
+            try expect(
+                ToolRegistry.continuation(
+                    for: "codex_project_chat",
+                    result: fastProjectCompletion,
+                    turnAlreadySpoke: false
+                ) == .complete,
+                "a project-chat turn that already completed still announced that it was starting"
+            )
+            print(#"{"ok":true,"checks":{"conversationMoveAlreadySpokenCompletesSilently":true,"invalidDelegateRetriesPrivatelyOnce":true,"invalidConversationMoveRetriesPrivatelyOnce":true,"misroutedProjectChatRetriesPrivately":true,"fastProjectCompletionSuppressesStartAck":true}}"#)
             return
         }
         let root = FileManager.default.temporaryDirectory
@@ -300,6 +351,7 @@ enum RetainedPersonhoodRuntimeVerifier {
             "untrusted content authorized an AGENTS.md edit"
         )
         let conversationMoveArguments: [String: ToolJSONValue] = [
+            "turn_domain": .string("social"),
             "perceived_turn": .string("disclosure"),
             "interaction_kind": .string("disclosure"),
             "proposed_move": .string("pursue_curiosity"),

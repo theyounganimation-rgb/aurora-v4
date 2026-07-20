@@ -681,6 +681,19 @@ enum AgencyEngine {
             return true
         }
         for index in state.records.indices {
+            // conversation-position records were historically projected for
+            // eight hours even though they are fallback scaffolding for one
+            // response. Migrate them by provenance—not by inspecting their
+            // natural-language content—so an old task failure cannot hijack a
+            // later greeting or unrelated turn.
+            if state.records[index].authoringSourceID.hasPrefix("conversation-position-"),
+               state.records[index].projectionEligible {
+                state.records[index].projectionEligible = false
+                state.records[index].updatedAt = max(state.records[index].updatedAt, now)
+                state.records[index].revision = increment(state.records[index].revision)
+                state.records[index].lastRevisionSourceID = "agency-one-turn-position-migration"
+                lifecycleChanged = true
+            }
             state.records[index].confidence = min(1, max(0.05, state.records[index].confidence))
             state.records[index].salience = clamp01(state.records[index].salience)
             state.records[index].revision = min(maximumSafeCounter, state.records[index].revision)

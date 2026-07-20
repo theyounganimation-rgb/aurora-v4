@@ -19,6 +19,7 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
     case requestTimedOut(method: String)
     case requestCancelled
     case chatGPTLoginRequired
+    case expectedProjectTurnChanged
     case projectMessagePreparationFailed
     case serverError(code: Int, message: String)
 
@@ -33,6 +34,8 @@ enum CodexTaskRuntimeError: LocalizedError, Sendable, Equatable {
         case .requestTimedOut: return "The verification runtime request timed out."
         case .requestCancelled: return "The verification runtime request was cancelled."
         case .chatGPTLoginRequired: return "Codex must be signed in with ChatGPT."
+        case .expectedProjectTurnChanged:
+            return "The selected Codex chat advanced to a different turn."
         case .projectMessagePreparationFailed:
             return "The project message failed before submission."
         case .serverError(_, let message): return message
@@ -316,6 +319,8 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
     private var projectThreads: [AuroraCodexThreadSummary] = []
     private var exactMessages: [ExactMessageRecord] = []
     private var exactMessageError: CodexTaskRuntimeError?
+    private var exactMessageTerminalBeforeReturn = false
+    private var exactMessageErrorAfterTerminal: CodexTaskRuntimeError?
     private var projectTaskIDByThreadID: [String: String] = [:]
 
     func setEventHandler(
@@ -410,6 +415,30 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
             turnID: turnID,
             params: ["turn": ["id": turnID, "status": "inProgress"]]
         )
+        if exactMessageTerminalBeforeReturn {
+            activeTaskIDs.remove(taskID)
+            emit(
+                method: "turn/completed",
+                taskID: taskID,
+                threadID: threadID,
+                turnID: turnID,
+                params: [
+                    "turn": [
+                        "id": turnID,
+                        "status": "completed",
+                        "items": [[
+                            "id": "fast-final-\(exactMessages.count)",
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "The fast selected-chat relay finished.",
+                        ]],
+                    ],
+                ]
+            )
+            if let exactMessageErrorAfterTerminal {
+                throw exactMessageErrorAfterTerminal
+            }
+        }
         return CodexTaskHandle(taskID: taskID, threadID: threadID, turnID: turnID)
     }
 
@@ -425,6 +454,14 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
 
     func setExactMessageError(_ error: CodexTaskRuntimeError?) {
         exactMessageError = error
+    }
+
+    func configureExactMessageTerminalBeforeReturn(
+        _ enabled: Bool,
+        thenThrow error: CodexTaskRuntimeError? = nil
+    ) {
+        exactMessageTerminalBeforeReturn = enabled
+        exactMessageErrorAfterTerminal = error
     }
 
     func steerTask(taskID: String, input: String) async throws {
@@ -534,6 +571,7 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
     func reconcileExactProjectThread(
         taskID: String,
         threadID: String,
+        expectedTurnID: String?,
         expectedWorkingDirectory: URL
     ) async throws -> CodexDelegateTaskReconciliation {
         guard let thread = projectThreads.first(where: { $0.threadID == threadID }),
@@ -548,9 +586,13 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
         projectTaskIDByThreadID[threadID] = taskID
         reconciliationTaskIDs.append(taskID)
         if let configured = reconciliationByThreadID[threadID] {
+            if let expectedTurnID,
+               configured.latestTurnID != expectedTurnID {
+                throw CodexTaskRuntimeError.expectedProjectTurnChanged
+            }
             return configured
         }
-        return CodexDelegateTaskReconciliation(
+        let observation = CodexDelegateTaskReconciliation(
             threadID: threadID,
             latestTurnID: currentTurnIDByTaskID[taskID],
             status: activeTaskIDs.contains(taskID) ? .running : nil,
@@ -558,6 +600,11 @@ private actor VerificationCodexDelegateRuntime: CodexDelegateTaskRunning {
             threadName: thread.name,
             workspacePath: expectedWorkingDirectory.path
         )
+        if let expectedTurnID,
+           observation.latestTurnID != expectedTurnID {
+            throw CodexTaskRuntimeError.expectedProjectTurnChanged
+        }
+        return observation
     }
 
     func setReconciliation(_ observation: CodexDelegateTaskReconciliation) {
@@ -3231,6 +3278,7 @@ private struct DelegateTaskVerification {
         try await verifyFreshInstallDefaultWorkspace()
         try await verifyRuntimeReadinessAndSafeReprobe()
         try await verifyCodexProjectChatMode()
+        try await verifyUnboundProjectChatMigration()
 
         try verifyNoPhraseRouterReferences()
         return checks
@@ -3613,6 +3661,7 @@ private struct DelegateTaskVerification {
                 && rejectedRelay.detail.localizedCaseInsensitiveContains("rejected")
                 && persistedRejection?.resultSummary
                     == "Codex rejected the project-chat message."
+                && persistedRejection?.operationLedger?.last?.codexTurnID == nil
                 && rejectedRecordCount == 1,
             "an explicit Codex rejection lost its distinct spoken or durable truth"
         )
@@ -3697,6 +3746,75 @@ private struct DelegateTaskVerification {
             "reselecting an existing Codex chat collided with its canonical task owner"
         )
 
+        let fastSpeech = "Finish this tiny follow-up immediately."
+        let fastAuthorization = try projectAuthorization(
+            relay,
+            relayText: fastSpeech,
+            resolvedTarget: try await projectTarget(coordinator!, relay),
+            callID: "project-fast-relay-call",
+            turnID: "project-fast-relay-turn",
+            transcript: fastSpeech
+        )
+        await runtime.configureExactMessageTerminalBeforeReturn(true)
+        let fastRelay = await coordinator!.projectChat(
+            proposal: relay,
+            authorization: fastAuthorization
+        )
+        await runtime.configureExactMessageTerminalBeforeReturn(false)
+        let fastTerminalPersisted = await eventually {
+            guard let state = try? store.load(),
+                  let record = state.records.first(where: {
+                      $0.taskID == relayed.taskID
+                  }) else { return false }
+            return record.status == .completed
+                && record.codexTurnID == "project_turn_3"
+                && record.resultSummary == "The fast selected-chat relay finished."
+        }
+        try expect(
+            fastRelay.code == .accepted
+                && !fastRelay.backgroundTask
+                && fastTerminalPersisted,
+            "a selected-chat completion that beat the send handle was lost or announced as newly started"
+        )
+
+        let ambiguousSpeech = "Try another fast follow-up."
+        let ambiguousAuthorization = try projectAuthorization(
+            relay,
+            relayText: ambiguousSpeech,
+            resolvedTarget: try await projectTarget(coordinator!, relay),
+            callID: "project-ambiguous-relay-call",
+            turnID: "project-ambiguous-relay-turn",
+            transcript: ambiguousSpeech
+        )
+        await runtime.configureExactMessageTerminalBeforeReturn(
+            true,
+            thenThrow: .transportFailure
+        )
+        let ambiguousRelay = await coordinator!.projectChat(
+            proposal: relay,
+            authorization: ambiguousAuthorization
+        )
+        await runtime.configureExactMessageTerminalBeforeReturn(false)
+        let ambiguousRecord = try store.load()?.records.first(where: {
+            $0.taskID == relayed.taskID
+        })
+        let ambiguousLedger = ambiguousRecord?.operationLedger ?? []
+        let ambiguousOperationID = ambiguousLedger.last(where: {
+            $0.event == .authorized
+        })?.operationID
+        try expect(
+            ambiguousRelay.code == .acceptanceUnknown
+                && ambiguousRecord?.status == .running
+                && ambiguousRecord?.statusKnowledge == .lastKnown
+                && ambiguousRecord?.codexTurnID == nil
+                && ambiguousOperationID == ambiguousAuthorization.requestID
+                && !ambiguousLedger.contains(where: {
+                    $0.operationID == ambiguousOperationID
+                        && $0.event.isTerminal
+                }),
+            "an unaccepted fast turn terminalized the latest project-chat authorization"
+        )
+
         for index in 0..<192 {
             let speech = "Course follow-up \(index)."
             let authorization = try projectAuthorization(
@@ -3723,7 +3841,7 @@ private struct DelegateTaskVerification {
             .map { $0.operationLedger?.count ?? 0 }
             .max() ?? 0
         try expect(
-            longChatRecords.count == 194 && maximumLedgerCount <= 384,
+            longChatRecords.count == 196 && maximumLedgerCount <= 384,
             "long-lived project chat exceeded its durable ledger boundary"
         )
 
@@ -3736,7 +3854,7 @@ private struct DelegateTaskVerification {
         await restoredRuntime.setProjectThreads(restoredPage.threads)
         await restoredRuntime.setReconciliation(CodexDelegateTaskReconciliation(
             threadID: courseID,
-            latestTurnID: "project_turn_194",
+            latestTurnID: "project_turn_196",
             status: .completed,
             resultSummary: "The first exercise is ready, with one follow-up decision.",
             threadName: "Start AI Engineering course",
@@ -3755,11 +3873,17 @@ private struct DelegateTaskVerification {
         let reconciledRestoredContext = await restored.sessionContext(
             sessionID: "restored-project-session"
         )
+        let boundedRestoredContext = String(reconciledRestoredContext.prefix(1_200))
         try expect(
             restoredContext.contains("Start AI Engineering course")
                 && restoredContext.contains("AI Engineering Journey")
                 && reconciledRestoredContext.contains("completed")
-                && reconciledRestoredContext.contains("first exercise is ready"),
+                && reconciledRestoredContext.contains("first exercise is ready")
+                && boundedRestoredContext.contains("Start AI Engineering course")
+                && boundedRestoredContext.contains("AI Engineering Journey")
+                && boundedRestoredContext.contains(
+                    "Relay each work message through codex_project_chat exactly"
+                ),
             "selected Codex focus or its completed result did not survive relaunch"
         )
 
@@ -3798,6 +3922,253 @@ private struct DelegateTaskVerification {
             "conditional intent or screen observation authorized a Codex chat relay"
         )
         await restored.shutdown()
+    }
+
+    private mutating func verifyUnboundProjectChatMigration() async throws {
+        let root = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath,
+            isDirectory: true
+        ).appendingPathComponent(
+            ".aurora-unbound-project-migration-\(UUID().uuidString.lowercased())",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspace = root.appendingPathComponent("Aurora V4", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: workspace,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let stateURL = root
+            .appendingPathComponent("state", isDirectory: true)
+            .appendingPathComponent("state.json")
+        let store = DelegateTaskStore(fileURL: stateURL)
+        let now = Date()
+        let operationID = "unbound-relay-operation"
+        let threadID = "019f4932-8edd-72d0-9d59-caea545e2ed5"
+        let unrelatedTurnID = "019f-unrelated-latest-turn"
+        let ledger = [
+            DelegateTaskOperationLedgerEntry(
+                sequence: 1,
+                operationID: operationID,
+                event: .authorized,
+                operation: .start,
+                revision: 1,
+                authorizationID: "unbound-relay-authorization",
+                sourceTurnIDs: ["unbound-relay-source-turn"],
+                authorizedEffect: "Send this exact message.",
+                codexTurnID: nil,
+                executorStatus: nil,
+                effectReceipt: nil,
+                resultSummary: nil,
+                recordedAt: now
+            ),
+            DelegateTaskOperationLedgerEntry(
+                sequence: 2,
+                operationID: operationID,
+                event: .failed,
+                operation: nil,
+                revision: 1,
+                authorizationID: nil,
+                sourceTurnIDs: nil,
+                authorizedEffect: nil,
+                codexTurnID: nil,
+                executorStatus: .failed,
+                effectReceipt: nil,
+                resultSummary: "Codex rejected the project-chat message.",
+                recordedAt: now.addingTimeInterval(1)
+            ),
+            DelegateTaskOperationLedgerEntry(
+                sequence: 3,
+                operationID: operationID,
+                event: .completed,
+                operation: nil,
+                revision: 1,
+                authorizationID: nil,
+                sourceTurnIDs: nil,
+                authorizedEffect: nil,
+                codexTurnID: unrelatedTurnID,
+                executorStatus: .completed,
+                effectReceipt: nil,
+                resultSummary: "Unrelated Codex work was completed.",
+                recordedAt: now.addingTimeInterval(2)
+            ),
+        ]
+        let taskID = "codex_project_unbound_fixture"
+        let persisted = DelegateTaskPersistedRecord(
+            taskID: taskID,
+            codexThreadID: threadID,
+            codexTurnID: unrelatedTurnID,
+            originatingSessionID: "unbound-project-session",
+            taskKind: .general,
+            executionClass: .project,
+            rootAuthorizationID: "unbound-relay-authorization",
+            sourceTurnIDs: ["unbound-relay-source-turn"],
+            goal: "Send this exact message.",
+            successCriteria: nil,
+            workspacePath: workspace.path,
+            createdAt: now,
+            updatedAt: now.addingTimeInterval(2),
+            status: .completed,
+            statusKnowledge: .live,
+            revision: 1,
+            resultSummary: "Unrelated Codex work was completed.",
+            resultReport: nil,
+            effectVerified: false,
+            stepCount: 0,
+            cancellationPending: false,
+            operationLedger: ledger,
+            effectReportingContractVersion: nil,
+            isProjectChat: true
+        )
+        let singleUnboundTaskID = "codex_project_single_unbound_fixture"
+        let singleUnboundOperationID = "single-unbound-operation"
+        let singleUnboundTurnID = "019f-single-unbound-turn"
+        let singleUnbound = DelegateTaskPersistedRecord(
+            taskID: singleUnboundTaskID,
+            codexThreadID: "019f-single-unbound-thread",
+            codexTurnID: singleUnboundTurnID,
+            originatingSessionID: "single-unbound-session",
+            taskKind: .general,
+            executionClass: .project,
+            rootAuthorizationID: "single-unbound-authorization",
+            sourceTurnIDs: ["single-unbound-source-turn"],
+            goal: "A relay whose terminal was never executor-bound.",
+            successCriteria: nil,
+            workspacePath: workspace.path,
+            createdAt: now,
+            updatedAt: now.addingTimeInterval(3),
+            status: .failed,
+            statusKnowledge: .live,
+            revision: 1,
+            resultSummary: "An unrelated turn failed.",
+            resultReport: nil,
+            effectVerified: false,
+            stepCount: 4,
+            cancellationPending: false,
+            operationLedger: [
+                DelegateTaskOperationLedgerEntry(
+                    sequence: 1,
+                    operationID: singleUnboundOperationID,
+                    event: .authorized,
+                    operation: .start,
+                    revision: 1,
+                    authorizationID: "single-unbound-authorization",
+                    sourceTurnIDs: ["single-unbound-source-turn"],
+                    authorizedEffect: "A relay whose terminal was never executor-bound.",
+                    codexTurnID: nil,
+                    executorStatus: nil,
+                    effectReceipt: nil,
+                    resultSummary: nil,
+                    recordedAt: now
+                ),
+                DelegateTaskOperationLedgerEntry(
+                    sequence: 2,
+                    operationID: singleUnboundOperationID,
+                    event: .failed,
+                    operation: nil,
+                    revision: 1,
+                    authorizationID: nil,
+                    sourceTurnIDs: nil,
+                    authorizedEffect: nil,
+                    codexTurnID: singleUnboundTurnID,
+                    executorStatus: .failed,
+                    effectReceipt: nil,
+                    resultSummary: "An unrelated turn failed.",
+                    recordedAt: now.addingTimeInterval(3)
+                ),
+            ],
+            effectReportingContractVersion: nil,
+            isProjectChat: true
+        )
+        do {
+            try store.save(DelegateTaskPersistedState(
+                records: [persisted, singleUnbound],
+                projectChatFocus: CodexProjectChatPersistedFocus(
+                    mode: .threadSelected,
+                    projectName: "Aurora V4",
+                    workspacePath: workspace.path,
+                    threadWorkspacePath: workspace.path,
+                    threadID: threadID,
+                    threadName: "Audit OpenClaw Aurora",
+                    taskID: taskID
+                ),
+                projectChatGeneration: 1
+            ))
+        } catch {
+            throw DelegateTaskVerificationFailure.failed(
+                "unbound migration fixture could not save: \(error.localizedDescription)"
+            )
+        }
+
+        let runtime = VerificationCodexDelegateRuntime()
+        await runtime.setProjectThreads([AuroraCodexThreadSummary(
+            threadID: threadID,
+            name: "Audit OpenClaw Aurora",
+            preview: "Unrelated latest work",
+            workingDirectory: workspace,
+            status: "idle",
+            source: "vscode",
+            createdAt: now,
+            updatedAt: now,
+            ephemeral: false
+        )])
+        await runtime.setReconciliation(CodexDelegateTaskReconciliation(
+            threadID: threadID,
+            latestTurnID: unrelatedTurnID,
+            status: .completed,
+            resultSummary: "Unrelated Codex work was completed.",
+            threadName: "Audit OpenClaw Aurora",
+            workspacePath: workspace.path
+        ))
+        let coordinator = DelegateTaskCoordinator(
+            runtime: runtime,
+            homeDirectory: root,
+            defaultProjectDirectory: workspace,
+            store: store,
+            legacyRecovery: nil
+        )
+        let context = await coordinator.sessionContext(
+            sessionID: "unbound-project-relaunch"
+        )
+        let reconciliations = await runtime.reconciliationIDs()
+        let repaired: DelegateTaskPersistedState?
+        do {
+            repaired = try store.load()
+        } catch {
+            throw DelegateTaskVerificationFailure.failed(
+                "unbound migration fixture could not reload: \(error.localizedDescription)"
+            )
+        }
+        let repairedRecord = repaired?.records.first(where: { $0.taskID == taskID })
+        let repairedSingle = repaired?.records.first(where: {
+            $0.taskID == singleUnboundTaskID
+        })
+        try expect(
+            reconciliations.isEmpty
+                && repaired?.projectChatFocus?.threadID == threadID
+                && repairedRecord?.status == .failed
+                && repairedRecord?.codexTurnID == nil
+                && repairedRecord?.resultSummary
+                    == "Codex rejected the project-chat message."
+                && repairedRecord?.operationLedger?.count == 2
+                && repairedSingle?.status == .running
+                && repairedSingle?.statusKnowledge == .lastKnown
+                && repairedSingle?.codexTurnID == nil
+                && repairedSingle?.resultSummary == nil
+                && repairedSingle?.stepCount == 0
+                && repairedSingle?.operationLedger?.count == 1
+                && context.contains("Audit OpenClaw Aurora")
+                && context.contains("failed")
+                && !context.contains("Unrelated Codex work"),
+            "an unbound failed relay adopted an unrelated selected-thread turn after relaunch (reconciliations=\(reconciliations), focus=\(repaired?.projectChatFocus?.threadID ?? "nil"), status=\(repairedRecord?.status.rawValue ?? "nil"), turn=\(repairedRecord?.codexTurnID ?? "nil"), result=\(repairedRecord?.resultSummary ?? "nil"), ledger=\(repairedRecord?.operationLedger?.count ?? -1), single_status=\(repairedSingle?.status.rawValue ?? "nil"), single_turn=\(repairedSingle?.codexTurnID ?? "nil"), single_ledger=\(repairedSingle?.operationLedger?.count ?? -1), context=\(context))"
+        )
+        await coordinator.shutdown()
     }
 
     private mutating func verifyFreshInstallDefaultWorkspace() async throws {

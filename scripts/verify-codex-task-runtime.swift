@@ -71,6 +71,7 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
     private var simulatesOversizedHistoryOnIncludeTurns = false
     private var nextTurnStartError: [String: Any]?
     private var nextTurnSteerError: [String: Any]?
+    private var completeNextTurnBeforeStartResponse = false
 
     init(
         accountMode: AccountMode = .chatGPT,
@@ -207,6 +208,22 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
                 "threadId": threadID,
                 "turn": ["id": turnID, "status": "inProgress"],
             ])
+            if completeNextTurnBeforeStartResponse {
+                completeNextTurnBeforeStartResponse = false
+                notify(method: "turn/completed", params: [
+                    "threadId": threadID,
+                    "turn": [
+                        "id": turnID,
+                        "status": "completed",
+                        "items": [[
+                            "id": "fast-runtime-final",
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "The fast runtime turn completed.",
+                        ]],
+                    ],
+                ])
+            }
             respond(id: id, result: [
                 "turn": ["id": turnID, "items": [], "status": "inProgress"],
             ])
@@ -309,6 +326,10 @@ private actor FakeCodexAppServerTransport: CodexAppServerTransporting {
 
     func failNextTurnSteer(code: Int = -32_000, message: String) {
         nextTurnSteerError = ["code": code, "message": message]
+    }
+
+    func completeNextTurnBeforeReturningStartHandle() {
+        completeNextTurnBeforeStartResponse = true
     }
 
     func setFailsToStart(_ fails: Bool) {
@@ -914,6 +935,50 @@ private enum CodexTaskRuntimeVerifier {
                 && !existingMethods.contains("thread/read"),
             "owner-selected thread executed before unarchived/project validation"
         )
+
+        let reusedEvents = EventCollector()
+        await existingRuntime.setEventHandler { event in
+            Task { await reusedEvents.append(event) }
+        }
+        await existingTransport.setThreadListResponses([
+            threadListFixture([
+                desktopThreadFixture(
+                    threadID: existingThreadID,
+                    cwd: projectDirectory.path,
+                    turns: []
+                ),
+            ]),
+        ])
+        await existingTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": existingHandle.turnID,
+                "status": "completed",
+                "itemsView": "notLoaded",
+                "items": [],
+            ]]),
+        ])
+        await existingTransport.completeNextTurnBeforeReturningStartHandle()
+        let reusedHandle = try await existingRuntime.sendExactMessage(
+            taskID: "project.owner-existing",
+            threadID: existingThreadID,
+            input: "One tiny follow-up.",
+            expectedWorkingDirectory: projectDirectory
+        )
+        try await Task.sleep(for: .milliseconds(25))
+        let reusedEventsArrived = await reusedEvents.events().contains {
+            $0.method == "turn/completed"
+                && $0.taskID == "project.owner-existing"
+                && $0.turnID == reusedHandle.turnID
+        }
+        let reusedActiveTurn = await existingRuntime.activeTurnID(
+            forTaskID: "project.owner-existing"
+        )
+        try expect(
+            reusedHandle.turnID == "turn-2"
+                && reusedActiveTurn == nil
+                && reusedEventsArrived,
+            "a reused-chat completion that beat turn/start was dropped or left falsely running"
+        )
         await existingRuntime.shutdown()
 
         let activeTransport = FakeCodexAppServerTransport()
@@ -1157,6 +1222,7 @@ private enum CodexTaskRuntimeVerifier {
         let terminal = try await terminalRuntime.reconcileExactProjectThread(
             taskID: "project.inspect-terminal",
             threadID: terminalThreadID,
+            expectedTurnID: "turn-project-complete",
             expectedWorkingDirectory: projectDirectory
         )
         try expect(
@@ -1243,6 +1309,7 @@ private enum CodexTaskRuntimeVerifier {
         let raced = try await racingRuntime.reconcileExactProjectThread(
             taskID: "project.inspect-racing",
             threadID: racingThreadID,
+            expectedTurnID: "turn-project-racing",
             expectedWorkingDirectory: projectDirectory
         )
         try expect(
@@ -1321,6 +1388,7 @@ private enum CodexTaskRuntimeVerifier {
         let running = try await runningRuntime.reconcileExactProjectThread(
             taskID: "project.inspect-running",
             threadID: runningThreadID,
+            expectedTurnID: "turn-project-running",
             expectedWorkingDirectory: projectDirectory
         )
         let reconciledActiveTurn = await runningRuntime.activeTurnID(
@@ -1345,6 +1413,51 @@ private enum CodexTaskRuntimeVerifier {
             "live project inspection emitted an action RPC"
         )
         await runningRuntime.shutdown()
+
+        let changedThreadID = "thread-project-changed-turn"
+        let changedTransport = FakeCodexAppServerTransport()
+        await changedTransport.setThreadListResponses([threadListFixture([
+            desktopThreadFixture(
+                threadID: changedThreadID,
+                cwd: projectDirectory.path,
+                turns: []
+            ),
+        ])])
+        await changedTransport.setThreadTurnsListResponses([
+            threadTurnsListFixture([[
+                "id": "turn-unrelated-latest",
+                "status": "inProgress",
+                "itemsView": "summary",
+                "items": [],
+            ]]),
+        ])
+        let changedRuntime = makeRuntime(transport: changedTransport)
+        do {
+            _ = try await changedRuntime.reconcileExactProjectThread(
+                taskID: "project.inspect-changed-turn",
+                threadID: changedThreadID,
+                expectedTurnID: "turn-durably-bound",
+                expectedWorkingDirectory: projectDirectory
+            )
+            throw VerificationFailure.failed(
+                "an unrelated latest project turn was adopted during exact reconciliation"
+            )
+        } catch CodexTaskRuntimeError.expectedProjectTurnChanged {
+            // Expected: reject before resume, task binding, or event sync.
+        }
+        let changedMethods = try decodeMessages(
+            await changedTransport.messageData()
+        ).compactMap { $0["method"] as? String }
+        let changedMapping = await changedRuntime.threadID(
+            forTaskID: "project.inspect-changed-turn"
+        )
+        try expect(
+            changedMapping == nil
+                && !changedMethods.contains("thread/resume")
+                && changedMethods.filter { $0 == "thread/turns/list" }.count == 1,
+            "turn mismatch was detected only after the unrelated thread was bound"
+        )
+        await changedRuntime.shutdown()
 
         let archivedTransport = FakeCodexAppServerTransport()
         await archivedTransport.setThreadListResponses([threadListFixture([])])

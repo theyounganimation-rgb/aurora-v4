@@ -136,6 +136,11 @@ private final class RealtimeProbe: @unchecked Sendable {
             "type": "object",
             "additionalProperties": false,
             "properties": [
+                "turn_domain": [
+                    "type": "string",
+                    "enum": ["social"],
+                    "description": "This probe exercises ordinary social turns only.",
+                ],
                 "perceived_turn": [
                     "type": "string",
                     "enum": [
@@ -251,7 +256,7 @@ private final class RealtimeProbe: @unchecked Sendable {
                 ],
             ],
             "required": [
-                "perceived_turn", "interaction_kind", "proposed_move", "answer_degree",
+                "turn_domain", "perceived_turn", "interaction_kind", "proposed_move", "answer_degree",
                 "aurora_first_person_position", "private_rationale", "record_ids",
                 "record_updates", "understanding_updates",
             ],
@@ -546,8 +551,8 @@ private final class RealtimeProbe: @unchecked Sendable {
         throw LiveConversationProbeError.timedOut
     }
 
-    /// Confirms the live Realtime model selects the explicit project/chat
-    /// function and satisfies its strict nullable schema. No Codex task is
+    /// Confirms the live Realtime model selects the project/chat route from
+    /// the same three semantic choices production exposes. No Codex task is
     /// opened and no local focus or external state is changed by this probe.
     func codexProjectChat(_ text: String) async throws -> ProbeCodexProjectChat {
         let schemaData = try JSONEncoder().encode(
@@ -557,6 +562,24 @@ private final class RealtimeProbe: @unchecked Sendable {
                 as? [String: Any] else {
             throw LiveConversationProbeError.invalidDelegateTask("project schema")
         }
+        let delegateData = try JSONEncoder().encode(
+            DelegateTaskProposal.realtimeFunctionSchema
+        )
+        var conversationSchema = Self.conversationMoveTool
+        guard let delegateSchema = try JSONSerialization.jsonObject(
+            with: delegateData
+        ) as? [String: Any],
+        var parameters = conversationSchema["parameters"] as? [String: Any],
+        var properties = parameters["properties"] as? [String: Any],
+        var turnDomain = properties["turn_domain"] as? [String: Any] else {
+            throw LiveConversationProbeError.invalidDelegateTask("semantic schemas")
+        }
+        turnDomain["enum"] = ["social", "delegated_action", "codex_project_chat"]
+        turnDomain["description"] = "Truthful semantic domain of the finalized owner turn. Named Codex project or chat navigation, selection, status, continuation, and relay are codex_project_chat."
+        properties["turn_domain"] = turnDomain
+        parameters["properties"] = properties
+        conversationSchema["parameters"] = parameters
+        conversationSchema["description"] = "Ordinary social replies only. Truthfully classify turn_domain even when that makes this the wrong route. Named Codex project/chat work uses codex_project_chat; other external work uses delegate_task."
         try await send([
             "type": "conversation.item.create",
             "item": [
@@ -570,9 +593,9 @@ private final class RealtimeProbe: @unchecked Sendable {
             "response": [
                 "output_modalities": ["audio"],
                 "max_output_tokens": 256,
-                "tools": [schema],
-                "tool_choice": ["type": "function", "name": "codex_project_chat"],
-                "instructions": "Resolve this finalized owner request privately. Call codex_project_chat once with every required nullable property and emit no audio.",
+                "tools": [conversationSchema, schema, delegateSchema],
+                "tool_choice": "required",
+                "instructions": "Resolve the finalized owner turn exactly once with the correct semantic function and emit no audio. Use codex_project_chat for any request to work in, select, open, inspect, continue, or message a named Codex project/chat, even before a later work message is supplied. Use delegate_task only for other external work and conversation_move only for social conversation.",
             ],
         ])
         let deadline = Date().addingTimeInterval(45)
@@ -724,7 +747,7 @@ private final class RealtimeProbe: @unchecked Sendable {
         }
 
         let requiredFields: Set<String> = [
-            "perceived_turn", "interaction_kind", "proposed_move", "answer_degree",
+            "turn_domain", "perceived_turn", "interaction_kind", "proposed_move", "answer_degree",
             "aurora_first_person_position", "private_rationale", "record_ids",
             "record_updates", "understanding_updates",
         ]
@@ -732,6 +755,11 @@ private final class RealtimeProbe: @unchecked Sendable {
         guard requiredFields.isSubset(of: Set(arguments.keys)),
               Set(arguments.keys).isSubset(of: allowedFields) else {
             throw LiveConversationProbeError.invalidConversationMove("top-level fields")
+        }
+        guard try boundedString(
+            "turn_domain", in: arguments, maximumCharacters: 48
+        ) == "social" else {
+            throw LiveConversationProbeError.invalidConversationMove("turn_domain")
         }
 
         let perceivedTurn = try boundedString(
